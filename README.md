@@ -1,0 +1,263 @@
+# ORcode — Holy Open Relay (HOR-loop)
+
+> 🔄 **HOR-loop = Holy Open Relay** — 多模型协作框架
+
+## 🎯 项目简介
+
+**ORcode** 是一款运行在终端里的命令行 AI 智能体工具，核心采用 **HOR-loop (Holy Open Relay)** 多模型工作流：把复杂任务交给一组「岗位」（Director / Planner / Workers / Verifier）分工协作，而不是单靠一个模型。
+
+- 输入 `orcode` 进入**交互式 TUI 终端界面**（暗色主题、鼠标可操作、实时工作树）；
+- 或用 `orcode run "指令"` **直接在命令行跑一次任务**；
+- 支持任意 OpenAI 兼容协议（DeepSeek / Moonshot / 本地 vLLM 等），也支持 Anthropic / Google / Ollama。
+
+### ✨ 主要特性
+
+- **两种使用模式**：普通文字 = 单模型直接对话；`/hor-loop` = 多模型全流程协作
+- **五步添加模型**：供应商 → Base URL → API Key → 模型 ID → 显示名称，不预置任何假模型
+- **`/models` 模型选择面板**：按供应商分组，键盘 / 鼠标悬停选择，支持搜索过滤
+- **实时工作树**：右侧岗位状态随执行动态更新，当前执行岗位高亮
+- **设置面板**：可视化调整 workers 数量、验证轮数、切换各岗位模型（支持鼠标点击与快捷键）
+- **SQLite 持久化**：自动记录每轮会话与消息（Node 22+ 内置 `node:sqlite`，不可用时降级内存）
+- **零重型依赖**：核心逻辑纯 Node.js 内置模块，ANSI TUI 自绘，无需 ink 等框架
+
+## 🚀 快速开始
+
+### 环境要求
+
+- **Node.js ≥ 22.0.0**（SQLite 持久化依赖 Node 22+ 内置的 `node:sqlite`）
+- 一个可用的模型 API Key（DeepSeek / OpenAI / 本地 Ollama 等均可）
+
+### 安装
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/你的用户名/ORcode.git
+cd ORcode
+
+# 2. （可选）设为全局命令，之后可在任意目录使用 `orcode`
+npm link
+# 或直接用 node 运行（无需安装）：node orcode.cjs
+
+# 3. 查看版本
+orcode --version
+```
+
+> 提示：`npm link` 会把 `orcode` 命令软链到全局；若不想污染全局，直接 `node orcode.cjs` 也能用。
+
+### 初始化（引导添加第一个真实模型）
+
+```bash
+orcode init
+```
+
+首次初始化引导你添加自己的模型（五步，**不预置任何假模型**）：
+
+```
+📦 首次使用 — 请添加你的第一个模型 (之后可在设置中继续添加)
+   [直接回车可跳过, 稍后在 TUI 设置中添加]
+
+  步骤 1/5 · 供应商名称 (如 openai / deepseek / ollama): deepseek
+  步骤 2/5 · Base URL (如 https://api.deepseek.com/v1): https://api.deepseek.com/v1
+  步骤 3/5 · API Key (可留空): sk-xxxxxxxx
+  步骤 4/5 · 模型 ID (如 deepseek-chat): deepseek-chat
+  步骤 5/5 · 显示名称 (如 DeepSeek V3): DeepSeek V3
+
+✅ 初始模型已设为: DeepSeek V3 (deepseek)
+```
+
+添加的模型会成为所有岗位的初始模型，状态栏左侧也会显示它。**未配置模型时，单模型调用和 `/hor-loop` 都会提示先添加模型**。
+
+### 进入界面
+
+```bash
+orcode
+```
+
+直接输入 `orcode` 回车，即进入交互式 TUI 界面：
+- 左上角 **ORCODE** 像素块状标识
+- 左下角输入框
+- 右下角设置齿轮（**可点击打开**，或按 `ctrl+,`）
+- 右侧工作树（岗位实时状态）
+- Director 在主会话中思考，最终输出为粉色主题
+
+### ⚡ 两种使用方式
+
+| 输入 | 行为 |
+|------|------|
+| **直接输入文字 + 回车** | **单模型调用** — 用初始模型直接对话（ Director 岗位显示思考状态） |
+| `/hor-loop` + 回车，再输入任务 | **多模型工作流** — Director → Planner → Workers → Verifier 全流程 |
+
+```bash
+# 单模型 (TUI 内直接输入)
+> 你好，请介绍一下你自己
+
+# 多模型 (TUI 内)
+> /hor-loop
+> 设计一个塔防游戏
+```
+
+### 运行单个任务（CLI 直接执行）
+
+```bash
+orcode run "分析物理作业：动能公式推导"
+```
+
+## 🔄 HOR-loop 工作流
+
+```
+/hor-loop 输入
+    ↓
+👨‍💼 director  (接收指令，协调全局)
+    ↓
+🧠 planner    (生成执行计划)
+    ↓
+📝 draft      (生成草稿)
+    ↓
+💻 workers × N (并行执行，数量可配置)
+    ↓
+👀 verifier × M (验证结果，轮数可配置)
+    ↓
+🎯 director   (整合输出 - Pink Theme)
+```
+
+## ⚙️ 配置
+
+配置文件位于 `~/.orcode/config.json`（由 `orcode init` 和设置面板自动生成）：
+
+```json
+{
+  "workers": 2,
+  "verifyRounds": 1,
+  "defaultModel": { "name": "DeepSeek V3", "provider": "deepseek" },
+  "models": [
+    {
+      "name": "DeepSeek V3",
+      "provider": "deepseek",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "modelId": "deepseek-chat"
+    }
+  ],
+  "positions": {
+    "director": { "name": "DeepSeek V3", "provider": "deepseek", "baseUrl": "...", "modelId": "deepseek-chat" },
+    "planner":  { "...": "同上" },
+    "worker":   { "...": "同上" },
+    "verifier": { "...": "同上" },
+    "draft":    { "...": "同上" }
+  },
+  "apiKeys": {
+    "deepseek": "sk-..."
+  }
+}
+```
+
+- `workers`：并行 worker 模型数量
+- `verifyRounds`：verifier 验证轮数
+- `defaultModel`：单模型调用使用的初始模型
+- `models`：已添加的模型列表（name=显示名，provider=供应商，baseUrl，modelId=实际模型 ID）
+- `positions`：每个岗位使用的模型（可重复）
+- `apiKeys`：按供应商名存储的 API Key
+
+### 支持的供应商
+
+| provider | 协议 |
+|----------|------|
+| `openai` | OpenAI `/chat/completions` |
+| `anthropic` / `claude` | Anthropic `/messages` |
+| `google` / `gemini` | Gemini `generateContent` |
+| `ollama` | 本地 Ollama（无需 Key） |
+| 其他任意名称 | 默认走 **OpenAI 兼容协议**（配 baseUrl 即可，如 DeepSeek / Moonshot / 本地 vLLM） |
+
+> 未配置 API Key 的供应商在调用时会明确报错提示，不会静默使用占位响应——请先通过 `orcode init` 或设置面板 `a` 添加真实模型。
+
+## 🎮 TUI 界面操作
+
+| 按键 | 功能 |
+|------|------|
+| 直接输入文字 + 回车 | **单模型调用**（初始模型对话） |
+| `/hor-loop` + 回车，再输入任务 | **启动多模型工作流** |
+| `/` | 显示命令面板（↑↓ 选择，回车执行） |
+| `Tab` | 切换选中的岗位 |
+| `点击右下角 ⚙` / `Ctrl+O` / `/settings` | 打开设置 |
+| `Esc` | 取消/清空输入 |
+| `Ctrl+C` | 退出程序 |
+
+### 命令列表
+
+```
+/hor-loop   启动 HOR-loop 多模型工作流
+/settings   打开设置
+/add-model  添加模型
+/models     模型选择面板 (按供应商分组, ↑↓/鼠标悬停选择, 输入字符过滤)
+/agents     切换岗位
+/help       帮助
+/exit       退出
+```
+
+### 设置面板
+
+**打开方式**：点击右下角 ⚙ 齿轮 / `Ctrl+O` / `/settings`
+
+**面板内按键**：
+
+| 按键 | 功能 |
+|------|------|
+| `-` / `+` | 调整并行 Workers 数量 |
+| `[` / `]` | 调整验证轮数 |
+| `d` | 循环更换初始模型 |
+| `Tab` | 切换岗位（选择要配置的岗位） |
+| `m` | 为选中岗位循环更换模型 |
+| `a` | **添加新模型** |
+| `Esc` | 保存并关闭 |
+
+### 添加模型（五步流程）
+
+按 `a` 后依次输入，**每步按回车确认**：
+
+```
+步骤 1/5  供应商名称    如 deepseek / openai / ollama
+步骤 2/5  Base URL      如 https://api.deepseek.com/v1
+步骤 3/5  API Key       可留空跳过
+步骤 4/5  模型 ID       如 deepseek-chat
+步骤 5/5  显示名称      如 DeepSeek V3
+```
+
+添加完成后三键分支（界面中有提示）：
+
+| 按键 | 行为 |
+|------|------|
+| `回车` | **继续添加同一供应商的模型**（只需再输模型 ID + 显示名称） |
+| `空格` | **添加其他供应商的模型**（重新走五步） |
+| `s` | **完成添加**，退出添加流程 |
+
+自定义供应商默认走 OpenAI 兼容协议（`/chat/completions`）。
+
+## 📁 项目结构
+
+```
+ORcode/
+├── orcode.cjs               # 主入口（CLI + TUI 分发）
+├── package.json
+├── README.md
+├── ARCHITECTURE.md
+└── scripts/
+    ├── start.js             # CLI 命令实现 (init/run)
+    ├── tui.js               # 交互式 TUI 界面
+    ├── model-client.js      # 模型 API 客户端
+    └── database-manager.js  # SQLite 持久化
+```
+
+## 🛠️ 技术特点
+
+- **零外部运行时依赖**：核心功能纯 Node.js 内置模块
+- **SQLite 持久化**：Node 22+ 内置 `node:sqlite`，自动降级内存模式
+- **多模型支持**：OpenAI / Anthropic / Ollama / Gemini
+- **ANSI TUI**：纯控制台渲染，无需 ink 等重型依赖
+
+## 📝 版本历史
+
+- **v0.2.0** (2026-10-14) - 纯 JS 架构，TUI 界面，SQLite 持久化，五步添加模型，`/models` 面板 + 鼠标悬停跟踪，状态栏实时模型数
+- **v0.1.0** (2026-10-12) - 初始版本，HOR-loop 核心流程
+
+## 📄 许可证
+
+MIT License

@@ -1,0 +1,46 @@
+{
+  "name": "orcode",
+  "version": "0.2.0",
+  "description": "Horizon Loop CLI Agent - Multi-Model Collaboration Framework",
+  "main": "orcode.cjs",
+  "bin": {
+    "orcode": "./orcode.cjs"
+  },
+  "scripts": {
+    "start": "node orcode.cjs",
+    "dev": "node scripts/start.js",
+    "link": "npm link",
+    "unlink": "npm unlink -g orcode"
+  },
+  "keywords": [
+    "cli",
+    "agent",
+    "hor-loop",
+    "holy-open-relay",
+    "multi-model",
+    "ai-agent",
+    "TUI"
+  ],
+  "author": "ORcode Team",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^11.0.0",
+    "ink": "^5.0.1",
+    "ink-progress-bar": "^1.0.0",
+    "better-sqlite3": "^9.4.3",
+    "zod": "^3.22.4",
+    "dotenv": "^16.4.1",
+    "chalk": "^5.3.0",
+    "ora": "^7.0.1",
+    "cli-spinners": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/better-sqlite3": "^7.6.8",
+    "typescript": "^5.3.2",
+    "prettier": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
