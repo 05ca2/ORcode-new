@@ -123,6 +123,7 @@ const GUIDE_COMMANDS = [
   ['/move', 'Move to another project dir'],
   ['/settings', 'Settings'],
   ['/add-model', 'Add a model'],
+  ['/ask', 'Demo: agent asks a questionnaire'],
   ['/history', 'View session history'],
   ['/run', 'Run task (alias of /hor-loop)']
 ];
@@ -146,6 +147,9 @@ class TUIState {
     this.modelsIndex = 0;          // 面板内扁平选中索引
     this.modelsFilter = '';        // 面板内搜索过滤词
     this._modelsGeom = null;       // 面板几何信息 (鼠标悬停/点击用)
+    this.questionnaire = null;     // 智能体提问问卷: null | {title,questions,qIndex,optIndex,selections}
+    this.questionnaireResolve = null; // 问卷 Promise 的 resolve (用户提交/跳过时调用)
+    this._qGeom = null;           // 问卷面板几何信息 (鼠标用)
     this.subSession = null;        // 岗位子会话: null | positionKey
     this.subSessionLog = [];       // 子会话内的对话记录
     this.running = false;
@@ -366,6 +370,7 @@ function render() {
   else if (state.addStep === 'afterAdd') placeholder = '回车 = 继续添加同一供应商模型 · 空格 = 添加其他供应商模型 · s = 完成添加';
   else if (state.subSession) placeholder = `子会话 · ${POSITIONS.find(p => p.key === state.subSession)?.label || ''} — 直接输入用该岗位模型执行 · Esc 返回`;
   else if (state.modelsOpen) placeholder = '模型选择中 · ↑↓/鼠标悬停选择 · 输入字符过滤 · enter 确认 · esc 关闭';
+  else if (state.questionnaire) placeholder = '问卷回答中 · ↑↓ 切换 · 空格 勾选/选择 · enter 提交 · esc 跳过';
   else if (state.waitingForTask) placeholder = '输入任务内容，回车启动 HOR-loop 多模型工作流';
   else if (state.currentInput) placeholder = '';
 
@@ -400,6 +405,9 @@ function render() {
 
   // ---------- /models 模型选择面板 ----------
   if (state.modelsOpen) renderModelPanel();
+
+  // ---------- 智能体问卷面板 ----------
+  if (state.questionnaire) renderQuestionnaire();
 
   // ---------- 设置面板 ----------
   if (state.settingsOpen) renderSettingsPanel();
@@ -514,7 +522,7 @@ async function runSubSessionCall(instruction) {
       positions: { [key]: modelEntry }
     });
     try {
-      result = await callModelSafe(key, instruction, singleCfg);
+      result = await runModelWithQuestionnaire(key, instruction, singleCfg);
     } catch (e) {
       result = `[错误] ${e.message}`;
     }
@@ -651,6 +659,218 @@ function applySelectedModel() {
   state._modelsGeom = null;
   state.currentInput = '';
   state.log(`✓ 初始模型已切换: ${m.name} (${m.provider})`);
+  render();
+}
+
+// ---------- 智能体问卷 (模型不确定时向用户提问, 支持单选/多选) ----------
+// 模型在回复中嵌入如下块即可触发问卷 (选项需具体):
+//   <<<QUESTIONNAIRE
+//   {"title":"确认","questions":[{"id":"q1","prompt":"...","multi":false,"options":["A","B"]}]}
+//   QUESTIONNAIRE>>>
+
+const Q_MARK_START = '<<<QUESTIONNAIRE';
+const Q_MARK_END = 'QUESTIONNAIRE>>>';
+
+function extractQuestionnaire(text) {
+  const s = String(text || '');
+  const m = s.match(/<<<QUESTIONNAIRE([\s\S]*?)QUESTIONNAIRE>>>/);
+  if (!m) return { cleaned: s, q: null };
+  const cleaned = s.replace(/<<<QUESTIONNAIRE[\s\S]*?QUESTIONNAIRE>>>/, '').trim();
+  let q = null;
+  try {
+    const obj = JSON.parse(m[1].trim());
+    if (obj && Array.isArray(obj.questions) && obj.questions.length) q = obj;
+  } catch (e) { /* 非法 JSON 视为无问卷 */ }
+  return { cleaned, q };
+}
+
+function normalizeQuestionnaire(raw) {
+  const q = { title: raw.title || '需要你的确认', questions: [], qIndex: 0, optIndex: 0, selections: {} };
+  (raw.questions || []).forEach((qu, i) => {
+    if (!qu || !qu.prompt || !Array.isArray(qu.options) || qu.options.length === 0) return;
+    q.questions.push({
+      id: qu.id || ('q' + i),
+      prompt: String(qu.prompt),
+      multi: !!qu.multi,
+      options: qu.options.map(String)
+    });
+  });
+  return q;
+}
+
+function buildAnswerInstruction(original, answers) {
+  const lines = answers.map(a => `- ${a.prompt} → ${a.answers.length ? a.answers.join('、') : '(用户未选择)'}`);
+  return `${original}\n\n【用户回答问卷】\n${lines.join('\n')}\n请基于以上回答继续完成任务。`;
+}
+
+// 解析/render 后统一收集答案
+function collectAnswers(q) {
+  return q.questions.map(qu => ({
+    id: qu.id,
+    prompt: qu.prompt,
+    multi: qu.multi,
+    answers: (q.selections[qu.id] || []).map(oi => qu.options[oi]).filter(Boolean)
+  }));
+}
+
+function questionnaireToggle() {
+  const q = state.questionnaire;
+  if (!q) return;
+  const qu = q.questions[q.qIndex];
+  const sel = q.selections[qu.id] || (q.selections[qu.id] = []);
+  const idx = q.optIndex;
+  if (qu.multi) {
+    const p = sel.indexOf(idx);
+    if (p >= 0) sel.splice(p, 1); else sel.push(idx);
+  } else {
+    q.selections[qu.id] = [idx];
+  }
+}
+
+function moveQCursor(delta) {
+  const q = state.questionnaire;
+  const flat = [];
+  q.questions.forEach((qu, qi) => qu.options.forEach((o, oi) => flat.push([qi, oi])));
+  let i = flat.findIndex(([qi, oi]) => qi === q.qIndex && oi === q.optIndex);
+  if (i < 0) i = 0;
+  i = Math.max(0, Math.min(flat.length - 1, i + delta));
+  q.qIndex = flat[i][0];
+  q.optIndex = flat[i][1];
+}
+
+function showQuestionnaire(qData) {
+  const q = normalizeQuestionnaire(qData);
+  if (q.questions.length === 0) return Promise.resolve([]);
+  state.questionnaire = q;
+  state.questionnaireResolve = null;
+  render();
+  return new Promise(res => { state.questionnaireResolve = res; });
+}
+
+function resolveQuestionnaire(answers) {
+  const r = state.questionnaireResolve;
+  state.questionnaire = null;
+  state.questionnaireResolve = null;
+  state._qGeom = null;
+  render();
+  if (r) r(answers);
+}
+
+function handleQuestionnaireKey(str, key) {
+  const q = state.questionnaire;
+  if (!q) return;
+  if (key.name === 'escape') { resolveQuestionnaire(null); return; }       // 跳过
+  if (key.name === 'return' || key.name === 'enter') { resolveQuestionnaire(collectAnswers(q)); return; }
+  if (key.name === 'up') { moveQCursor(-1); render(); return; }
+  if (key.name === 'down') { moveQCursor(1); render(); return; }
+  if (key.name === 'left') {
+    const qu = q.questions[q.qIndex];
+    q.optIndex = Math.max(0, q.optIndex - 1); render(); return;
+  }
+  if (key.name === 'right') {
+    const qu = q.questions[q.qIndex];
+    q.optIndex = Math.min(qu.options.length - 1, q.optIndex + 1); render(); return;
+  }
+  if (str === ' ') { questionnaireToggle(); render(); return; }
+}
+
+function renderQuestionnaire() {
+  const q = state.questionnaire;
+  if (!q) return;
+  const W = state.terminalWidth, H = state.terminalHeight;
+  const qn = q.questions;
+  let pw = 56;
+  qn.forEach(qu => {
+    pw = Math.max(pw, displayWidth(qu.prompt) + 8);
+    qu.options.forEach(o => { pw = Math.max(pw, displayWidth(o) + 10); });
+  });
+  pw = Math.min(W - 8, pw);
+  let lines = 3; // 顶栏 + 标题 + 空行
+  qn.forEach(qu => { lines += 1 + qu.options.length + 1; });
+  lines += 1; // 底部提示
+  const ph = lines;
+  const px = Math.max(2, Math.floor((W - pw) / 2));
+  const py = Math.max(1, Math.floor((H - ph) / 2) - 1);
+
+  for (let i = 0; i < ph; i++) { moveCursor(px, py + i); process.stdout.write(' '.repeat(pw)); }
+  const title = `─ ${q.title} `;
+  const dash = Math.max(0, pw - 2 - displayWidth(title));
+  moveCursor(px, py);
+  process.stdout.write(`${c.border}╭${title}${'─'.repeat(dash)}╮${c.reset}`);
+
+  let ry = py + 2;
+  const rows = [];
+  qn.forEach((qu, qi) => {
+    moveCursor(px + 2, ry);
+    const cur = qi === q.qIndex;
+    process.stdout.write(`${cur ? c.accent : c.sub}Q${qi + 1}. ${qu.prompt}${c.reset}`);
+    ry++;
+    qu.options.forEach((opt, oi) => {
+      const sel = (q.selections[qu.id] || []).includes(oi);
+      const isCur = qi === q.qIndex && oi === q.optIndex;
+      const box = qu.multi ? (sel ? '[✓]' : '[ ]') : (sel ? '◉' : '○');
+      const marker = isCur ? '▸ ' : '  ';
+      const line = `${marker}${box} ${opt}`;
+      moveCursor(px + 4, ry);
+      if (isCur) process.stdout.write(`${c.reverse}${c.text}${line}${c.reset}`);
+      else process.stdout.write(`${sel ? c.green : c.text}${line}${c.reset}`);
+      rows.push({ y: ry, qIdx: qi, optIdx: oi });
+      ry++;
+    });
+    ry++;
+  });
+  moveCursor(px + 2, ry);
+  const multi = qn.some(x => x.multi);
+  process.stdout.write(`${c.faint}↑↓ 切换 · 空格 ${multi ? '勾选' : '选择'} · enter 提交 · esc 跳过${c.reset}`);
+  state._qGeom = { px, py, pw, ph, rows };
+}
+
+// 模型调用封装: 若回复含问卷则弹出, 收集答案后追加回指令继续 (最多 5 轮)
+async function runModelWithQuestionnaire(role, instruction, cfg) {
+  let currentInstruction = instruction;
+  let finalResult = '';
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let result;
+    try {
+      result = await callModelSafe(role, currentInstruction, cfg);
+    } catch (e) {
+      return `[错误] ${e.message}`;
+    }
+    const { cleaned, q } = extractQuestionnaire(result);
+    if (!q) {
+      finalResult = (cleaned && cleaned.trim()) ? cleaned : result;
+      break;
+    }
+    if (cleaned && cleaned.trim()) state.log(`  ${cleaned.trim()}`, c.sub);
+    state.log(`◆ 需要向你确认 (${q.questions.length} 个问题)` + (q.title ? ` · ${q.title}` : ''), c.accent);
+    const answers = await showQuestionnaire(q);
+    if (!answers) {
+      state.log(`  ↳ 你跳过了提问，继续`, c.faint);
+      finalResult = (cleaned && cleaned.trim()) ? cleaned : result;
+      break;
+    }
+    answers.forEach(a => {
+      state.log(`  ↳ ${a.prompt}: ${a.answers.length ? a.answers.join('、') : '(未选择)'}`, c.green);
+    });
+    currentInstruction = buildAnswerInstruction(instruction, answers);
+  }
+  return finalResult;
+}
+
+// 演示: 模拟 Agent 在开工前先提问 (无需 API 即可体验)
+async function demoQuestionnaire() {
+  const sample = {
+    title: '开工前确认',
+    questions: [
+      { id: 'q1', prompt: '目标语言?', multi: false, options: ['中文', 'English', '双语'] },
+      { id: 'q2', prompt: '重点关注?', multi: true, options: ['性能', '可读性', '安全性'] },
+      { id: 'q3', prompt: '输出形式?', multi: false, options: ['代码片段', '设计说明', '两者都要'] }
+    ]
+  };
+  state.log('◆ Director 在开工前想先确认几个问题：', c.accent);
+  const answers = await showQuestionnaire(sample);
+  if (!answers) { state.log('  ↳ 你跳过了提问', c.faint); render(); return; }
+  answers.forEach(a => state.log(`  ↳ ${a.prompt}: ${a.answers.length ? a.answers.join('、') : '(未选择)'}`, c.green));
   render();
 }
 
@@ -978,7 +1198,7 @@ async function runSingleModel(instruction) {
 
   let result;
   try {
-    result = await callModelSafe('director', instruction, singleCfg);
+    result = await runModelWithQuestionnaire('director', instruction, singleCfg);
   } catch (e) {
     result = `[错误] ${e.message}`;
   }
@@ -1001,7 +1221,7 @@ async function runSingleModel(instruction) {
 }
 
 // ---------- 斜杠命令执行 ----------
-function executeGuideCommand(cmd) {
+async function executeGuideCommand(cmd) {
   const parts = cmd.split(' ');
   const command = parts[0];
   state.currentInput = '';
@@ -1024,6 +1244,11 @@ function executeGuideCommand(cmd) {
       state.settingsOpen = true;
       state.log('◆ 添加模型 — 步骤 1/5: 输入供应商名称');
       startAddModel();
+      break;
+    case '/ask':
+    case '/questionnaire':
+      state.currentInput = '';
+      demoQuestionnaire();
       break;
     case '/hor-loop':
     case '/run': {
@@ -1176,6 +1401,18 @@ function confirmAddStep(text) {
 
 // ---------- 鼠标悬停跟踪 (光标跟随鼠标) ----------
 function handleMouseHover(col, row) {
+  // 智能体问卷: 悬停移动光标到对应选项
+  if (state.questionnaire) {
+    const g = state._qGeom;
+    if (!g) return;
+    const hit = g.rows.find(r => r.y === row);
+    if (hit && (hit.qIdx !== state.questionnaire.qIndex || hit.optIdx !== state.questionnaire.optIndex)) {
+      state.questionnaire.qIndex = hit.qIdx;
+      state.questionnaire.optIndex = hit.optIdx;
+      render();
+    }
+    return;
+  }
   // /models 模型面板: 悬停移动选中项
   if (state.modelsOpen) {
     const g = state._modelsGeom;
@@ -1223,6 +1460,22 @@ function handleMouseClick(col, row) {
       state.addStep = null;
     }
     render();
+    return;
+  }
+
+  // 智能体问卷打开时: 点击选项行 = 选择/勾选, 点击面板外 = 跳过
+  if (state.questionnaire) {
+    const g = state._qGeom;
+    if (!g) return;
+    const inside = col >= g.px && col <= g.px + g.pw && row >= g.py && row <= g.py + g.ph;
+    if (!inside) { resolveQuestionnaire(null); return; }
+    const hit = g.rows.find(r => r.y === row);
+    if (hit) {
+      state.questionnaire.qIndex = hit.qIdx;
+      state.questionnaire.optIndex = hit.optIdx;
+      questionnaireToggle();
+      render();
+    }
     return;
   }
 
@@ -1454,6 +1707,12 @@ async function handleKey(str, key) {
     process.stdout.write('\x1b[?25h\x1b[?1000l\x1b[?1003l\x1b[?1006l');
     console.log(`\n${c.sub}再见${c.reset}`);
     process.exit(0);
+  }
+
+  // ---- 智能体问卷 (最高优先级, 弹出时拦截所有其它输入) ----
+  if (state.questionnaire) {
+    handleQuestionnaireKey(str, key);
+    return;
   }
 
   // ---- /models 模型选择面板 ----
