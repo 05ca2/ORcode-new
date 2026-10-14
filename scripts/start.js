@@ -16,13 +16,15 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户初始化时添加真实模型)
 const defaultConfig = {
-  version: '0.2.0',
+  version: '0.2.2',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
   models: [],
   positions: {},
   workspaceDir: homePath,
+  defaultWorkspaceDir: null,
+  initialized: false,
   apiKeys: {}
 };
 
@@ -42,17 +44,35 @@ function init() {
   const ask = (q) => new Promise(res => rl.question(q, res));
 
   (async () => {
-    console.log('\n📦 首次使用 — 请添加你的第一个模型 (之后可在设置中继续添加)');
+    console.log('\n📦 首次使用 — 完成初始化 (默认工作区必填, 模型可稍后补)');
+
+    // 步骤 0: 默认工作区 (必填)
+    const workspace = (await ask('  步骤 0 · 默认工作区目录 (必填, 如 ~/projects 或 /home/user/projects): ')).trim();
+    let ws = workspace;
+    if (!ws) {
+      rl.close();
+      console.log('\n❌ 默认工作区不能为空 — 初始化中止, 请重新运行 orcode init');
+      return;
+    }
+    if (ws === '~') ws = homePath;
+    else if (ws.startsWith('~/')) ws = path.join(homePath, ws.slice(2));
+    else ws = path.resolve(ws);
+    config.defaultWorkspaceDir = ws;
+    config.workspaceDir = ws;
+    console.log(`  ✓ 默认工作区: ${ws}`);
+
+    console.log('\n   接下来添加你的第一个模型 (之后可在设置中继续添加)');
     console.log('   [直接回车可跳过, 稍后在 TUI 设置中添加]\n');
 
     const provider = (await ask('  步骤 1/5 · 供应商名称 (如 openai / deepseek / ollama): ')).trim();
 
     if (!provider) {
-      // 跳过模型配置
+      // 跳过模型配置, 仍完成初始化
+      config.initialized = true;
       fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
       rl.close();
-      console.log('\n⏭️  已跳过模型配置');
-      console.log('📝 初始化完成！运行 "orcode" 进入 TUI');
+      console.log('\n⏭️  已跳过模型配置 (可稍后在 TUI 设置中按 a 添加)');
+      console.log('✅ 初始化完成！运行 "orcode" 进入 TUI');
       console.log('   按 Ctrl+O 或点击右下角 ⚙ 打开设置, 按 a 添加模型');
       return;
     }
@@ -77,6 +97,7 @@ function init() {
     config.defaultModel = { name: displayName, provider };
     ALL_POSITIONS.forEach(k => { config.positions[k] = { ...entry }; });
 
+    config.initialized = true;
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
     rl.close();
     console.log(`\n✅ 初始模型已设为: ${displayName} (${provider})`);

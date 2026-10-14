@@ -16,13 +16,15 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.0',
+  version: '0.2.2',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
   models: [],
   positions: {},
   workspaceDir: homePath,
+  defaultWorkspaceDir: null,   // 初始化时填写的默认工作区 (新会话继承此值)
+  initialized: false,          // 是否已初始化 (orcode init 后变为 true)
   apiKeys: {}
 };
 
@@ -37,6 +39,8 @@ function loadConfig() {
     if (!cfg.models) cfg.models = [];
     if (!cfg.positions) cfg.positions = {};
     if (!cfg.apiKeys) cfg.apiKeys = {};
+    if (!cfg.defaultWorkspaceDir) cfg.defaultWorkspaceDir = cfg.workspaceDir || null;
+    if (typeof cfg.initialized !== 'boolean') cfg.initialized = false;
     if (!cfg.defaultModel) {
       cfg.defaultModel = cfg.models.length > 0
         ? { name: cfg.models[0].name, provider: cfg.models[0].provider }
@@ -121,10 +125,15 @@ const GUIDE_COMMANDS = [
   ['/mcps', 'Toggle MCPs'],
   ['/models', 'Switch model'],
   ['/move', 'Move to another project dir'],
+  ['/cd', 'Change workspace dir (per session)'],
   ['/settings', 'Settings'],
   ['/add-model', 'Add a model'],
   ['/ask', 'Demo: agent asks a questionnaire'],
   ['/history', 'View session history'],
+  ['/init', 'Initialize ORcode (required first run)'],
+  ['/new', 'Open a new session tab'],
+  ['/close', 'Close current session tab'],
+  ['/archive', 'Save current session transcript to file'],
   ['/run', 'Run task (alias of /hor-loop)']
 ];
 
@@ -159,6 +168,19 @@ class TUIState {
     this.terminalWidth = process.stdout.columns || 100;
     this.terminalHeight = process.stdout.rows || 30;
 
+    // 每会话独立工作区 (从默认工作区继承)
+    this.workspaceDir = this.config.defaultWorkspaceDir || this.config.workspaceDir || homePath;
+
+    // 多会话 (浏览器式标签): sessions 保存各会话快照, activeIndex 为当前
+    this.sessions = [{ id: crypto.randomUUID().slice(0, 8), title: '会话 1', snapshot: null }];
+    this.activeIndex = 0;
+    this._tabsGeom = null;        // 标签栏几何信息 (鼠标点击用)
+
+    // 初始化门禁: 未初始化时 TUI 显示遮罩, 必须先 orcode init
+    this.needsInit = !this.config.initialized;
+    this.initMode = false;         // 内联初始化进行中
+    this.pathMode = null;          // 'workspace' = 正在输入路径以切换工作区
+
     POSITIONS.forEach(p => {
       this.positions[p.key] = {
         ...p,
@@ -168,6 +190,8 @@ class TUIState {
         output: null
       };
     });
+
+    // 枚举构造不需要自动序列化, 改为在 startTUI 中完成
   }
 
   get guideActive() {
@@ -198,6 +222,110 @@ class TUIState {
     this.history.push(color ? { text, color } : text);
     if (this.history.length > 200) this.history.shift();
   }
+}
+
+// ============ 多会话 (浏览器式标签) 管理 ============
+// 每会话独立的状态字段 — 切换时整体序列化/恢复
+const SESSION_FIELDS = [
+  'workspaceDir', 'history', 'currentInput', 'selectedIndex',
+  'subSession', 'subSessionLog', 'running', 'activePos',
+  'sessionId', 'tokens', 'positions'
+];
+
+function expandPath(p) {
+  if (!p) return '';
+  if (p === '~') return homePath;
+  if (p.startsWith('~/')) return path.join(homePath, p.slice(2));
+  return path.resolve(p);
+}
+
+// 把当前活跃会话的状态写入 sessions[idx].snapshot
+function serializeSession(idx) {
+  if (!state.sessions[idx]) return;
+  const snap = {};
+  SESSION_FIELDS.forEach(f => {
+    const v = state[f];
+    snap[f] = (f === 'positions') ? JSON.parse(JSON.stringify(v)) : v;
+  });
+  state.sessions[idx].snapshot = snap;
+}
+
+// 用 sessions[idx].snapshot 覆盖当前状态 (无快照则重置为全新会话)
+function restoreSession(idx) {
+  const snap = state.sessions[idx] && state.sessions[idx].snapshot;
+  if (!snap) { applyFreshSession(); return; }
+  SESSION_FIELDS.forEach(f => {
+    state[f] = (f === 'positions') ? JSON.parse(JSON.stringify(snap.positions)) : snap[f];
+  });
+}
+
+// 重置当前状态为全新会话 (从 config 继承工作区与岗位模型)
+function applyFreshSession() {
+  state.history = [];
+  state.currentInput = '';
+  state.selectedIndex = 0;
+  state.subSession = null;
+  state.subSessionLog = [];
+  state.running = false;
+  state.activePos = null;
+  state.sessionId = null;
+  state.tokens = 0;
+  state.workspaceDir = state.config.defaultWorkspaceDir || state.config.workspaceDir || homePath;
+  const positions = {};
+  POSITIONS.forEach(p => {
+    positions[p.key] = {
+      ...p,
+      status: 'idle',
+      model: state.config.positions[p.key]?.name || '-',
+      thought: [],
+      output: null
+    };
+  });
+  state.positions = positions;
+}
+
+function newSession() {
+  if (state.running || state.questionnaire) return;
+  serializeSession(state.activeIndex);
+  applyFreshSession();
+  const title = `会话 ${state.sessions.length + 1}`;
+  state.sessions.push({ id: crypto.randomUUID().slice(0, 8), title, snapshot: null });
+  state.activeIndex = state.sessions.length - 1;
+  state.log(`▸ 新建${title} · 工作区: ${state.workspaceDir}`);
+  render();
+}
+
+function switchSession(idx) {
+  if (idx === state.activeIndex) return;
+  if (idx < 0 || idx >= state.sessions.length) return;
+  if (state.running || state.questionnaire) return;  // 运行中禁止切换
+  serializeSession(state.activeIndex);
+  state.activeIndex = idx;
+  restoreSession(idx);
+  state.log(`▸ 切换到 ${state.sessions[idx].title}`);
+  render();
+}
+
+function closeSession(idx) {
+  if (state.sessions.length <= 1) {
+    state.log('◍ 至少要保留一个会话');
+    render();
+    return;
+  }
+  if (state.running || state.questionnaire) {
+    state.log('◍ 任务进行中，请完成后再关闭会话');
+    render();
+    return;
+  }
+  // 关闭前先把当前 (若正是它) 序列化, 选好邻居
+  const neighbor = (idx === state.activeIndex) ? Math.max(0, idx - 1) : state.activeIndex;
+  if (idx === state.activeIndex) serializeSession(idx);
+  state.sessions.splice(idx, 1);
+  if (idx < state.activeIndex) state.activeIndex--;
+  state.activeIndex = neighbor;
+  restoreSession(state.activeIndex);
+  state.log(`▸ 已关闭会话，当前: ${state.sessions[state.activeIndex].title}`);
+  render();
 }
 
 // ============ 渲染辅助 ============
@@ -263,6 +391,15 @@ function render() {
   if (!state) return;
   clearScreen();
 
+  // 未初始化遮罩: 强制先 orcode init
+  if (state.needsInit) {
+    renderInitOverlay();
+    return;
+  }
+
+  // 顶部标签栏 (浏览器式多会话)
+  renderTabBar();
+
   const W = state.terminalWidth;
   const H = state.terminalHeight;
   const treeW = Math.max(30, Math.floor(W * 0.34));
@@ -276,12 +413,12 @@ function render() {
   });
 
   // ---------- 左上: 路径与当前岗位 ----------
-  const wsDir = cfg.workspaceDir || '~';
+  const wsDir = state.workspaceDir || '~';
   write(2, 8, `${wsDir}`, c.text);
   write(2, 9, `当前岗位: ${POSITIONS[state.selectedIndex].label}`, c.sub);
 
   // ---------- 粉色分割线 (明显) ----------
-  for (let y = 1; y <= H - 5; y++) {
+  for (let y = 2; y <= H - 5; y++) {
     moveCursor(divX, y);
     process.stdout.write(`${c.pinkBright}║${c.reset}`);
   }
@@ -363,6 +500,7 @@ function render() {
   const prompt = '> ';
   let placeholder = 'Ask ORcode to do anything (单模型调用) · /hor-loop 多模型工作流';
   if (state.addStep === 'provider') placeholder = '步骤 1/5 · 输入供应商名称 (如 openai / deepseek / ollama)';
+  else if (state.addStep === 'workspace') placeholder = '初始化 · 输入默认工作区目录 (必填, 如 /home/user/projects 或 ~/projects)';
   else if (state.addStep === 'baseUrl') placeholder = '步骤 2/5 · 输入 Base URL (如 https://api.deepseek.com/v1，本地可 http://localhost:11434)';
   else if (state.addStep === 'apiKey') placeholder = '步骤 3/5 · 输入 API Key (可留空，直接回车跳过)';
   else if (state.addStep === 'modelId') placeholder = '步骤 4/5 · 输入模型 ID (如 deepseek-chat / qwen-max)';
@@ -371,6 +509,7 @@ function render() {
   else if (state.subSession) placeholder = `子会话 · ${POSITIONS.find(p => p.key === state.subSession)?.label || ''} — 直接输入用该岗位模型执行 · Esc 返回`;
   else if (state.modelsOpen) placeholder = '模型选择中 · ↑↓/鼠标悬停选择 · 输入字符过滤 · enter 确认 · esc 关闭';
   else if (state.questionnaire) placeholder = '问卷回答中 · ↑↓ 切换 · 空格 勾选/选择 · enter 提交 · esc 跳过';
+  else if (state.pathMode === 'workspace') placeholder = '切换工作区 · 输入路径 (enter 确认 · esc 取消)';
   else if (state.waitingForTask) placeholder = '输入任务内容，回车启动 HOR-loop 多模型工作流';
   else if (state.currentInput) placeholder = '';
 
@@ -389,8 +528,8 @@ function render() {
   process.stdout.write(`${c.border}${'─'.repeat(W - 1)}${c.reset}`);
   const mode = state.running ? 'running' : (state.waitingForTask ? 'awaiting' : 'idle');
   const defaultName = cfg.defaultModel?.name || '未配置模型';
-  const left = `${defaultName} · ${cfg.workspaceDir || '~'} · ${mode}`;
-  const right = `tab for agent · ? for shortcuts`;
+  const left = `${defaultName} · ${state.workspaceDir || '~'} · ${mode} · 会话 ${state.activeIndex + 1}/${state.sessions.length}`;
+  const right = `Ctrl+T 新会话 · Ctrl+W 关闭 · Ctrl+1-9 切换`;
   moveCursor(2, barY);
   process.stdout.write(`${c.sub}${truncateAnsi(left, divX - 4)}${c.reset}`);
   const rightX = W - displayWidth(right) - 6;
@@ -411,6 +550,72 @@ function render() {
 
   // ---------- 设置面板 ----------
   if (state.settingsOpen) renderSettingsPanel();
+}
+
+// ---------- 顶部标签栏 (浏览器式多会话) ----------
+function renderTabBar() {
+  const W = state.terminalWidth;
+  const y = 1;
+  moveCursor(1, y);
+  process.stdout.write(' '.repeat(W));   // 清空该行
+  const geom = [];
+  let x = 2;
+  state.sessions.forEach((t, i) => {
+    const active = i === state.activeIndex;
+    const wsd = i === state.activeIndex
+      ? state.workspaceDir
+      : (t.snapshot ? t.snapshot.workspaceDir : (state.config.defaultWorkspaceDir || state.config.workspaceDir));
+    const wsBase = (wsd ? path.basename(wsd) : '~');
+    const label = `${i + 1}.${t.title} · ${wsBase}`;
+    const disp = `${active ? '▸' : ' '}${label}${active ? ' ' : '  '}`;
+    moveCursor(x, y);
+    if (active) process.stdout.write(`${c.reverse}${c.text}${disp}${c.reset}`);
+    else process.stdout.write(`${c.sub}${label}  ${c.reset}`);
+    geom.push({ index: i, x1: x, x2: x + displayWidth(label) });
+    x += displayWidth(disp) + 1;
+  });
+  // [+] 新建
+  moveCursor(x, y);
+  const plus = '[+ 新会话]';
+  process.stdout.write(`${c.accent}${plus}${c.reset}`);
+  geom.push({ index: 'new', x1: x, x2: x + displayWidth(plus) });
+  state._tabsGeom = geom;
+}
+
+// ---------- 初始化遮罩 (未初始化时强制) ----------
+function renderInitOverlay() {
+  const W = state.terminalWidth;
+  const H = state.terminalHeight;
+  const title = '─ ORcode 尚未初始化 ─';
+  const lines = [
+    '',
+    '  请先完成初始化才能使用 ORcode。',
+    '',
+    '  ◆ 方式一: 在另一个终端运行  orcode init  (推荐)',
+    '  ◆ 方式二: 按 I 在此直接初始化 (填写默认工作区 + 模型)',
+    '',
+    '  初始化后, 按 R 重新加载配置即可进入。',
+    '',
+    '  [ I ] 立即初始化      [ R ] 重新加载      [ Q ] 退出',
+  ];
+  const pw = Math.max(46, Math.min(70, Math.max(...lines.map(l => displayWidth(l))) + 4));
+  const ph = lines.length + 4;
+  const px = Math.max(2, Math.floor((W - pw) / 2));
+  const py = Math.max(2, Math.floor((H - ph) / 2));
+  for (let i = 0; i < ph; i++) { moveCursor(px, py + i); process.stdout.write(' '.repeat(pw)); }
+  const top = `╭${title}${'─'.repeat(Math.max(0, pw - 2 - displayWidth(title)))}╮`;
+  moveCursor(px, py);
+  process.stdout.write(`${c.border}${top}${c.reset}`);
+  moveCursor(px, py + ph - 1);
+  process.stdout.write(`${c.border}╰${'─'.repeat(pw - 2)}╯${c.reset}`);
+  for (let i = 1; i < ph - 1; i++) {
+    moveCursor(px, py + i); process.stdout.write(`${c.border}│${c.reset}`);
+    moveCursor(px + pw - 1, py + i); process.stdout.write(`${c.border}│${c.reset}`);
+  }
+  lines.forEach((l, i) => {
+    moveCursor(px + 2, py + 2 + i);
+    process.stdout.write(`${c.text}${l}${c.reset}`);
+  });
 }
 
 // ---------- 岗位子会话视图 ----------
@@ -1220,6 +1425,68 @@ async function runSingleModel(instruction) {
   render();
 }
 
+// ---------- 初始化 / 工作区 / 存档 辅助 ----------
+function startInit() {
+  state.initMode = true;
+  state.needsInit = false;          // 放行 addStep 流程
+  state.addStep = 'workspace';
+  state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
+  state.currentInput = '';
+  state.log('◆ 初始化 ORcode — 步骤 0: 输入默认工作区目录 (必填, 如 ~/projects 或 /home/user/projects)');
+  render();
+}
+
+function completeInit() {
+  state.config.initialized = true;
+  if (!state.config.defaultWorkspaceDir) {
+    state.config.defaultWorkspaceDir = state.workspaceDir;
+  }
+  saveConfig(state.config);
+  state.initMode = false;
+  state.needsInit = false;
+  state.addStep = null;
+  state.log('✓ 初始化完成 — 现在可以开始使用 ORcode 了');
+  render();
+}
+
+function startPathMode() {
+  state.pathMode = 'workspace';
+  state.currentInput = '';
+  state.log('◆ 切换工作区 — 输入路径 (enter 确认 · esc 取消)');
+  render();
+}
+
+function archiveSession() {
+  const ws = state.workspaceDir || homePath;
+  try {
+    if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
+  } catch (e) { /* 忽略 */ }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const file = path.join(ws, `orcode-archive-${ts}.md`);
+  const head = [
+    '# ORcode 会话存档',
+    '',
+    `- 时间: ${new Date().toLocaleString('zh-CN')}`,
+    `- 工作区: ${ws}`,
+    `- 会话: ${state.sessions[state.activeIndex].title}`,
+    `- 初始模型: ${state.config.defaultModel?.name || '未配置'}`,
+    '',
+    '## 对话记录',
+    ''
+  ];
+  const body = state.history.map(h => {
+    if (typeof h === 'object' && h.text) return h.text;
+    return h;
+  });
+  try {
+    fs.writeFileSync(file, head.concat(body).join('\n'), 'utf-8');
+    state.log(`✓ 已存档到: ${file}`, c.green);
+  } catch (e) {
+    state.log(`✗ 存档失败: ${e.message}`, c.red);
+  }
+  render();
+}
+
 // ---------- 斜杠命令执行 ----------
 async function executeGuideCommand(cmd) {
   const parts = cmd.split(' ');
@@ -1295,6 +1562,28 @@ async function executeGuideCommand(cmd) {
       render();
       break;
     }
+    case '/init':
+      if (state.config.initialized) {
+        state.log('✓ 已经初始化过了 — 若要重新初始化，请运行 orcode init');
+        render();
+      } else {
+        startInit();
+      }
+      break;
+    case '/new':
+      newSession();
+      break;
+    case '/close':
+      closeSession(state.activeIndex);
+      break;
+    case '/cd':
+    case '/move':
+      startPathMode();
+      break;
+    case '/archive':
+    case '/save':
+      archiveSession();
+      break;
     case '/agents':
       state.selectedIndex = (state.selectedIndex + 1) % POSITIONS.length;
       state.log(`▸ 已切换岗位: ${POSITIONS[state.selectedIndex].label}`);
@@ -1337,7 +1626,21 @@ function confirmAddStep(text) {
   const d = state.addDraft;
 
   switch (state.addStep) {
+    case 'workspace':
+      if (!t) {
+        state.log('◍ 默认工作区不能为空 — 请重新输入 (如 ~/projects)');
+        render();
+        return;
+      }
+      state.config.defaultWorkspaceDir = expandPath(t);
+      state.workspaceDir = state.config.defaultWorkspaceDir;
+      state.addStep = 'provider';
+      state.currentInput = '';
+      state.log(`◆ 步骤 1/5: 输入供应商名称 (默认工作区: ${state.config.defaultWorkspaceDir})`);
+      break;
     case 'provider':
+      // 初始化模式下, 供应商留空 = 跳过模型添加, 直接完成初始化
+      if (!t && state.initMode) { completeInit(); return; }
       d.provider = t || 'custom';
       state.addStep = 'baseUrl';
       state.log(`◆ 步骤 2/5: 输入 Base URL (供应商: ${d.provider})`);
@@ -1451,6 +1754,16 @@ function handleMouseClick(col, row) {
   const treeW = Math.max(30, Math.floor(W * 0.34));
   const divX = W - treeW;
   const treeX = divX + 1;
+
+  // 标签栏点击 (y===1): 切换会话或新建
+  if (row === 1 && state._tabsGeom) {
+    const hit = state._tabsGeom.find(g => col >= g.x1 && col <= g.x2);
+    if (hit) {
+      if (hit.index === 'new') newSession();
+      else switchSession(hit.index);
+      return;
+    }
+  }
 
   // 点击右下角 ⚙ → 切换设置
   if (row >= H - 1 && col >= W - 4) {
@@ -1638,9 +1951,15 @@ function mapKey(ch) {
   if (ch === '\x7f' || ch === '\x08') return { name: 'backspace', str: '', ctrl: false, meta: false };
   if (ch === '\t') return { name: 'tab', str: '', ctrl: false, meta: false };
   const code = ch.charCodeAt(0);
-  // ctrl+字母: \x01-\x1a
+  // ctrl+字母/数字: \x01-\x1a (ASCII 1-26)
   if (code >= 1 && code <= 26) {
-    return { name: String.fromCharCode(code + 96), str: '', ctrl: true, meta: false };
+    let name;
+    if (code <= 9) {
+      name = String.fromCharCode(code + 48); // 1 -> '1', 9 -> '9'
+    } else {
+      name = String.fromCharCode(code + 96); // 10 -> 'j', 26 -> 'z'
+    }
+    return { name, str: '', ctrl: true, meta: false };
   }
   return { name: ch, str: ch, ctrl: false, meta: false };
 }
@@ -1709,6 +2028,25 @@ async function handleKey(str, key) {
     process.exit(0);
   }
 
+  // ---- 未初始化门禁 (初始化进行中 addStep 已激活则放行) ----
+  if (state.needsInit && !state.addStep) {
+    if (key.name === 'i' || str === 'i') { startInit(); return; }
+    if (key.name === 'r' || str === 'r') {
+      state.config = loadConfig();
+      state.needsInit = !state.config.initialized;
+      if (!state.needsInit) applyFreshSession();
+      state.log(state.needsInit ? '◍ 仍未检测到初始化，请先运行 orcode init' : '✓ 已检测到初始化配置，进入主界面');
+      render();
+      return;
+    }
+    if (key.name === 'q' || str === 'q') {
+      process.stdout.write('\x1b[?25h\x1b[?1000l\x1b[?1003l\x1b[?1006l');
+      console.log(`\n${c.sub}再见 (请先运行 orcode init)${c.reset}`);
+      process.exit(0);
+    }
+    return;   // 其它按键忽略, 直到初始化完成
+  }
+
   // ---- 智能体问卷 (最高优先级, 弹出时拦截所有其它输入) ----
   if (state.questionnaire) {
     handleQuestionnaireKey(str, key);
@@ -1772,6 +2110,41 @@ async function handleKey(str, key) {
     return;
   }
 
+  // ---- 切换工作区路径输入模式 (pathMode) ----
+  if (state.pathMode === 'workspace') {
+    if (key.name === 'escape') {
+      state.pathMode = null;
+      state.currentInput = '';
+      state.log('◍ 已取消切换工作区');
+      render();
+      return;
+    }
+    if (key.name === 'return' || key.name === 'enter') {
+      const p = expandPath(state.currentInput.trim());
+      if (!p) {
+        state.log('◍ 路径不能为空');
+        render();
+        return;
+      }
+      state.workspaceDir = p;
+      state.pathMode = null;
+      state.currentInput = '';
+      state.log(`✓ 工作区已切换为: ${p}`);
+      render();
+      return;
+    }
+    if (key.name === 'backspace') {
+      state.currentInput = state.currentInput.slice(0, -1);
+      render();
+      return;
+    }
+    if (str && !key.ctrl && !key.meta) {
+      state.currentInput += str;
+      render();
+    }
+    return;
+  }
+
   // ---- 添加模型流程 (最高优先级) ----
   if (state.addStep) {
     // 完成一步后的分支选择: 回车=同供应商继续 · 空格=其他供应商 · s=完成
@@ -1793,6 +2166,7 @@ async function handleKey(str, key) {
       }
       if (str === 's' || str === 'S') {  // s → 完成
         finishAddModel();
+        if (state.initMode) completeInit();
         return;
       }
       return; // 其他键忽略
@@ -1823,6 +2197,17 @@ async function handleKey(str, key) {
   if (state.settingsOpen) {
     if (handleSettingsKey(str, key)) return;
     return;
+  }
+
+  // ---- 多会话快捷键 (仅空闲时) ----
+  if (!state.running && !state.questionnaire && !state.modelsOpen && !state.addStep
+      && !state.subSession && !state.pathMode && !state.needsInit) {
+    if (key.ctrl && key.name === 't') { newSession(); return; }
+    if (key.ctrl && key.name === 'w') { closeSession(state.activeIndex); return; }
+    if (key.ctrl && /^[1-9]$/.test(key.name)) {
+      switchSession(parseInt(key.name, 10) - 1);
+      return;
+    }
   }
 
   // ---- ctrl+p 命令面板 (输入 /) ----
@@ -1962,6 +2347,9 @@ async function startTUI() {
 
   // 初始化数据库 (静默, 避免干扰 TUI 渲染)
   dbManager.initialize(true);
+
+  // 为首个会话生成快照 (state 已赋值)
+  serializeSession(0);
 
   render();
 
