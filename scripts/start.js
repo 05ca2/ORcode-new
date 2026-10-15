@@ -134,7 +134,7 @@ async function callModelSafe(role, instruction, config, context = '') {
       ? `\n\n[上下文] 以下是与你此次任务相关的背景信息 (最近对话与你的记忆)，请翻阅并善用它们：\n${context}\n[上下文结束]`
       : '';
 
-    const prompt = `作为 ${role}，请执行以下任务：\n${instruction}${contextBlock}\n\n[问卷说明] 如果你对任务有不确定之处、需要向用户澄清，可在回复末尾嵌入一份问卷（选项须具体、避免含糊）：\n<<<QUESTIONNAIRE\n{"title":"确认信息","questions":[{"id":"q1","prompt":"问题文本","multi":false,"options":["选项A","选项B"]}]}\nQUESTIONNAIRE>>>\n用户回答后将继续。若无需澄清，直接给出回答即可。\n\n[记忆说明] 如果用户在对话中透露了值得长期记住的事实 (偏好/项目背景/约定等)，可在回复末尾嵌入记忆块 (可多条)：\n<<<MEMORY\n{"content":"要记住的事实","tags":["偏好"]}\nMEMORY>>>`;
+    const prompt = `作为 ${role}，请执行以下任务：\n${instruction}${contextBlock}\n\n[文件工具] 你可以真实读取用户电脑上的文件来完成任务 (不需要问用户要内容, 直接读):\n- 读取文件: 在回复中嵌入 <<<READ {"path":"文件路径","reason":"读取原因"} READ>>>\n- 列出目录: 在回复中嵌入 <<<LIST {"path":"目录路径","reason":"列目录原因"} LIST>>>\n规则:\n- 相对路径基于工作区根目录; 也支持绝对路径与 ~\n- 系统会执行并把结果放在 [文件结果] 中回传给你, 然后你基于内容继续\n- 文本文件每次最多返回 4000 字符 (超长会截断, 可换更精确路径)\n- 工作区内的文件你有完整权限直接读; 工作区外系统会弹窗请用户批准, 若被拒绝你会收到失败提示, 此时再向用户说明\n- 一次回复可发起多个 READ/LIST; 拿到结果后如需继续读取就再发起\n\n[问卷说明] 如果你对任务有不确定之处、需要向用户澄清，可在回复末尾嵌入一份问卷（选项须具体、避免含糊）：\n<<<QUESTIONNAIRE\n{"title":"确认信息","questions":[{"id":"q1","prompt":"问题文本","multi":false,"options":["选项A","选项B"]}]}\nQUESTIONNAIRE>>>\n用户回答后将继续。若无需澄清，直接给出回答即可。\n\n[记忆说明] 如果用户在对话中透露了值得长期记住的事实 (偏好/项目背景/约定等)，可在回复末尾嵌入记忆块 (可多条)：\n<<<MEMORY\n{"content":"要记住的事实","tags":["偏好"]}\nMEMORY>>>`;
 
     // 本地服务 (ollama/localhost) 不需要 API Key
     const isLocal = roleConfig.provider === 'ollama'

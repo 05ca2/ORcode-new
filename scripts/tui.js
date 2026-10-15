@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.6',
+  version: '0.2.7',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -716,6 +716,89 @@ function extractMemories(text) {
   }
   const cleaned = s.replace(/<<<MEMORY[\s\S]*?MEMORY>>>/g, '').trim();
   return { cleaned, memories };
+}
+
+// ============ 模型文件工具 (读取/列目录, 权限实时生效) ============
+// 模型通过回复中的工具块请求文件访问, TUI 执行并经权限系统把关:
+//   <<<READ {"path":"...", "reason":"..."} READ>>>   读取文件 (最多 4000 字符)
+//   <<<LIST {"path":"...", "reason":"..."} LIST>>>   列出目录 (最多 100 项)
+
+// 解析模型给的路径: 相对路径基于当前工作区, ~ 基于 HOME
+function resolveModelPath(p) {
+  if (!p) return '';
+  let s = String(p).trim().replace(/^["']+|["']+$/g, '');
+  if (!s) return '';
+  if (s === '~') return homePath;
+  if (s.startsWith('~/')) return path.join(homePath, s.slice(2));
+  if (path.isAbsolute(s)) return path.normalize(s);
+  return path.resolve(state.workspaceDir || homePath, s);
+}
+
+function extractFileOps(text) {
+  const s = String(text || '');
+  const ops = [];
+  let m;
+  const readRe = /<<<READ\s*([\s\S]*?)\s*READ>>>/g;
+  while ((m = readRe.exec(s)) !== null) {
+    try {
+      const o = JSON.parse(m[1].trim());
+      if (o && o.path) ops.push({ type: 'read', path: String(o.path), reason: String(o.reason || '') });
+    } catch (e) { /* 非法 JSON 忽略 */ }
+  }
+  const listRe = /<<<LIST\s*([\s\S]*?)\s*LIST>>>/g;
+  while ((m = listRe.exec(s)) !== null) {
+    try {
+      const o = JSON.parse(m[1].trim());
+      if (o && o.path) ops.push({ type: 'list', path: String(o.path), reason: String(o.reason || '') });
+    } catch (e) { /* 非法 JSON 忽略 */ }
+  }
+  const cleaned = s.replace(/<<<READ[\s\S]*?READ>>>/g, '').replace(/<<<LIST[\s\S]*?LIST>>>/g, '').trim();
+  return { cleaned, ops };
+}
+
+// 执行文件操作 (权限不足时弹申请面板; 用户拒绝则返回错误回传给模型)
+async function executeFileOps(ops) {
+  const results = [];
+  for (const op of ops) {
+    const p = resolveModelPath(op.path);
+    if (!p) { results.push({ op, ok: false, error: '路径为空' }); continue; }
+    // 权限检查: 工作区内直接放行; 工作区外弹面板由用户决定
+    const ok = await checkPathPermission(p, 'read', op.reason || `模型请求${op.type === 'list' ? '列目录' : '读取文件'}`);
+    if (!ok) {
+      results.push({ op, ok: false, error: '用户拒绝了访问权限' });
+      state.log(`✗ 模型读取被拒绝: ${p}`, c.red);
+      render();
+      continue;
+    }
+    try {
+      if (op.type === 'list') {
+        const entries = fs.readdirSync(p, { withFileTypes: true });
+        const lines = entries.slice(0, 100).map(e => `${e.isDirectory() ? '[目录]' : '[文件]'} ${e.name}`);
+        results.push({ op, ok: true, content: lines.join('\n') || '(空目录)', resolved: p });
+        state.log(`📂 已列出目录: ${p} (${entries.length} 项)`, c.cyan);
+      } else {
+        const stat = fs.statSync(p);
+        if (stat.isDirectory()) {
+          results.push({ op, ok: false, error: '这是目录 — 请改用 LIST 列目录', resolved: p });
+          continue;
+        }
+        if (stat.size > 1024 * 1024) {
+          results.push({ op, ok: false, error: `文件过大 (${(stat.size / 1048576).toFixed(1)}MB > 1MB 上限)`, resolved: p });
+          continue;
+        }
+        let content = fs.readFileSync(p, 'utf-8');
+        const truncated = content.length > 4000;
+        if (truncated) content = content.slice(0, 4000);
+        results.push({ op, ok: true, content, truncated, resolved: p });
+        state.log(`📖 已读取文件: ${p} (${stat.size} 字节${truncated ? ', 截断至 4000 字符' : ''})`, c.cyan);
+      }
+    } catch (e) {
+      results.push({ op, ok: false, error: e.message, resolved: p });
+      state.log(`✗ 文件操作失败: ${p} — ${e.message}`, c.red);
+    }
+    render();
+  }
+  return results;
 }
 
 // ============ 对话上下文构建 (模型调用前注入) ============
@@ -1560,6 +1643,23 @@ async function runModelWithQuestionnaire(role, instruction, cfg, context = '') {
         state.log(`🧠 已记住: ${String(mem.content).slice(0, 60)}${mem.tags.length ? ` [${mem.tags.join(',')}]` : ''}`, c.cyan);
       });
       render();
+    }
+    // 提取模型的文件工具调用 (READ/LIST) 并真实执行 (权限系统把关)
+    const { cleaned: noOps, ops } = extractFileOps(result);
+    if (ops.length > 0) {
+      result = noOps;
+      state.log(`🔧 模型请求 ${ops.length} 个文件操作`, c.accent);
+      const fileResults = await executeFileOps(ops);
+      const feedback = fileResults.map(r => {
+        const target = r.resolved || resolveModelPath(r.op.path);
+        if (r.ok) {
+          const label = r.op.type === 'list' ? '目录列表' : '文件内容';
+          return `[文件结果·${label}] ${target}:\n${r.content}${r.truncated ? '\n...(内容过长已截断, 可换更精确的路径或文件)' : ''}`;
+        }
+        return `[文件结果·失败] ${target}: ${r.error}`;
+      }).join('\n\n');
+      currentInstruction = `${currentInstruction}\n\n${feedback}\n请基于以上文件结果继续完成任务 (如需更多文件可继续发起 READ/LIST)。`;
+      continue;   // 把文件结果回传给模型, 继续循环
     }
     const { cleaned, q } = extractQuestionnaire(result);
     if (!q) {
@@ -3215,6 +3315,9 @@ module.exports = {
     removeMemory,
     searchMemories,
     extractMemories,
+    resolveModelPath,
+    extractFileOps,
+    executeFileOps,
     handleKey: (str, key) => handleKey(str, key),
     handleKeyPublic: (str, key) => handleKey(str, key)
   }
