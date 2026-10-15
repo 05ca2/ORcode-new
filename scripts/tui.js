@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.3',
+  version: '0.2.4',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -192,6 +192,9 @@ class TUIState {
     this.permissionRequest = null;  // 待确认的权限申请: {path, action, reason, resolve}
     this._permGeom = null;         // 权限面板几何信息 (鼠标用)
 
+    // 对话历史滚动: 0 = 跟随底部 (最新); >0 = 向上翻看的行数
+    this.historyScroll = 0;
+
     POSITIONS.forEach(p => {
       this.positions[p.key] = {
         ...p,
@@ -240,7 +243,7 @@ class TUIState {
 const SESSION_FIELDS = [
   'workspaceDir', 'history', 'currentInput', 'cursorPosition', 'selectedIndex',
   'subSession', 'subSessionLog', 'running', 'activePos',
-  'sessionId', 'tokens', 'positions', 'permissions'
+  'sessionId', 'tokens', 'positions', 'permissions', 'historyScroll'
 ];
 
 function expandPath(p) {
@@ -287,6 +290,7 @@ function applyFreshSession() {
   state.permissions = Object.assign({}, state.config.pathPermissions || {}, { default: 'denied' });
   state.permissionRequest = null;
   state._permGeom = null;
+  state.historyScroll = 0;   // 新会话从最新对话开始看
   const positions = {};
   POSITIONS.forEach(p => {
     positions[p.key] = {
@@ -569,6 +573,25 @@ function showPermissionList() {
   render();
 }
 
+// ============ 对话历史 (翻看 + 分割线) ============
+// 每轮用户输入前插入一条分割线, 并把用户输入本身记入历史 (之前只记模型输出)
+function logUserTurn(text) {
+  state.history.push({ text: '', color: c.border, separator: true });
+  state.log(`▸ 你: ${text}`, c.accent);
+  state.historyScroll = 0;   // 新回合回到底部, 保证能看到响应
+}
+
+// 历史滚动: delta > 0 向上翻 (看更早), < 0 向下 (回近期); 夹紧到 [0, maxScroll]
+function scrollHistory(delta) {
+  const H = state.terminalHeight;
+  const historyTop = 11, historyBottom = H - 4;
+  const avail = historyBottom - historyTop;
+  const maxScroll = Math.max(0, state.history.length - avail);
+  const before = state.historyScroll;
+  state.historyScroll = Math.max(0, Math.min(maxScroll, state.historyScroll + delta));
+  if (state.historyScroll !== before) render();
+}
+
 // ============ 主渲染 ============
 function render() {
   if (!state) return;
@@ -616,15 +639,27 @@ function render() {
     write(2, historyTop, '欢迎使用 ORcode 终端模式。', c.text);
     write(2, historyTop + 1, '直接输入文字 = 单模型调用 (初始模型对话) · /hor-loop = 多模型工作流。', c.text);
     write(2, historyTop + 2, '/ 查看命令 · tab 切换岗位 · 空输入回车进子会话 · 点击 ⚙ 设置。', c.text);
+    write(2, historyTop + 3, '对话历史可翻看: 滚轮 / PgUp / PgDn · 每轮对话之间有分割线。', c.faint);
   } else {
     const historyBottom = H - 4;
-    const avail = historyBottom - historyTop;
-    const start = Math.max(0, state.history.length - avail);
-    for (let i = start; i < state.history.length; i++) {
+    const avail = historyBottom - historyTop;               // 面板可容纳行数
+    const total = state.history.length;
+    const maxScroll = Math.max(0, total - avail);           // 最多可上滚行数
+    if (state.historyScroll > maxScroll) state.historyScroll = maxScroll;
+    // historyScroll = 0 → 贴底 (显示最新); >0 → 向上翻这么多行
+    const start = Math.max(0, total - avail - state.historyScroll);
+    const end = Math.min(total, start + avail);   // 最多画 avail 行, 防止上滚时溢出面板
+    for (let i = start; i < end; i++) {
       const line = state.history[i];
+      const y = historyTop + (i - start);
+      // 对话分割线 (特殊行: 铺满面板宽度)
+      if (typeof line === 'object' && line.separator) {
+        write(2, y, '─'.repeat(Math.max(4, mainW - 5)), line.color || c.border);
+        continue;
+      }
       // 显式指定颜色的行 (对象) 直接使用
       if (typeof line === 'object' && line.color) {
-        write(2, historyTop + (i - start), truncateAnsi(line.text, mainW - 4), line.color);
+        write(2, y, truncateAnsi(line.text, mainW - 4), line.color);
         continue;
       }
       const text = typeof line === 'object' ? line.text : line;
@@ -634,7 +669,31 @@ function render() {
       if (text.includes('思考') || text.includes('分析')) color = c.yellow;
       if (text.includes('OUTPUT') || text.includes('Pink')) color = c.pinkBright;
       if (text.includes('◍') || text.includes('请输入')) color = c.yellow;
-      write(2, historyTop + (i - start), truncateAnsi(text, mainW - 4), color);
+      if (text.startsWith('▸ 你:')) color = c.accent;   // 用户输入行高亮
+      write(2, y, truncateAnsi(text, mainW - 4), color);
+    }
+
+    // ---------- 历史区滚动条 (紧贴粉色分割线左侧) ----------
+    if (maxScroll > 0) {
+      const sbX = divX - 1;
+      const trackH = avail;
+      for (let i = 0; i < trackH; i++) {
+        moveCursor(sbX, historyTop + i);
+        process.stdout.write(`${c.border}│${c.reset}`);
+      }
+      const ratio = avail / total;
+      const thumbH = Math.max(1, Math.floor(avail * ratio));
+      // 滚动位置: 贴底时滑块在底部; 翻到顶时在顶部
+      const thumbStart = Math.floor(((maxScroll - state.historyScroll) / maxScroll) * (trackH - thumbH));
+      for (let i = 0; i < thumbH; i++) {
+        moveCursor(sbX, historyTop + thumbStart + i);
+        process.stdout.write(`${c.accent}█${c.reset}`);
+      }
+      // 上翻时在面板底部显示回底提示
+      if (state.historyScroll > 0) {
+        moveCursor(2, historyBottom - 1);
+        process.stdout.write(`${c.yellow}↑ 已上滚 ${state.historyScroll} 行 · PgDn / 滚轮下滚回到底部${c.reset}`);
+      }
     }
   }
 
@@ -1882,6 +1941,7 @@ async function archiveSession() {
     ''
   ];
   const body = state.history.map(h => {
+    if (typeof h === 'object' && h.separator) return '\n---\n';
     if (typeof h === 'object' && h.text) return h.text;
     return h;
   });
@@ -2428,13 +2488,14 @@ function parseInput() {
           handleMouseClick(col, row);            // 左/中/右键按下 = 点击
         } else if (btn >= 64 && btn <= 67 && mouse[4] === 'M') {
           // 滚轮事件: 64=up, 65=down, 66=left, 67=right
-          // 只有当鼠标在设置面板内时才触发滚动
+          const wheelUp = btn === 64 || btn === 66;
+          // ① 设置面板内 → 设置面板滚动 (最高优先, 面板是覆盖层)
           if (state.settingsOpen && !state.addStep) {
             const pw = 52, ph = 17;
             const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
             const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
             if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
-              const delta = btn === 64 || btn === 66 ? -1 : 1;
+              const delta = wheelUp ? -1 : 1;
               const max = Math.max(0, 15 - (state.terminalHeight - 20));
               state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
               render();
@@ -2445,10 +2506,20 @@ function parseInput() {
             const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
             const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
             if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
-              const delta = btn === 64 || btn === 66 ? -1 : 1;
+              const delta = wheelUp ? -1 : 1;
               const max = Math.max(0, 22 - (state.terminalHeight - 20));
               state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
               render();
+            }
+          } else if (!state.questionnaire && !state.modelsOpen && !state.permissionRequest
+                     && !state.subSession && state.history.length > 0) {
+            // ② 鼠标在左栏对话历史区 (粉色分割线左侧) → 翻看历史
+            const treeW = Math.max(30, Math.floor(state.terminalWidth * 0.34));
+            const divX = state.terminalWidth - treeW;
+            const historyTop = 11, historyBottom = state.terminalHeight - 4;
+            if (col >= 2 && col < divX && row >= historyTop && row < historyBottom) {
+              // wheelUp → 看更早 (historyScroll++); wheelDown → 回近期 (historyScroll--)
+              scrollHistory(wheelUp ? 3 : -3);
             }
           }
         }
@@ -2463,6 +2534,14 @@ function parseInput() {
       const names = { A: 'up', B: 'down', C: 'right', D: 'left' };
       handleKey('', { name: names[csi[1]], ctrl: false, meta: false }).catch(() => {});
       inputBuffer = inputBuffer.slice(csi[0].length);
+      continue;
+    }
+    // 2b. CSI 序列 (PgUp=ESC[5~ / PgDn=ESC[6~) — 历史翻页
+    const pg = inputBuffer.match(/^\x1b\[([56])~/);
+    if (pg) {
+      const name = pg[1] === '5' ? 'pageup' : 'pagedown';
+      handleKey('', { name, ctrl: false, meta: false }).catch(() => {});
+      inputBuffer = inputBuffer.slice(pg[0].length);
       continue;
     }
     // 3. 单独 ESC — 等待 30ms 确认不是序列开头, 否则视为 Esc 键
@@ -2572,6 +2651,8 @@ async function handleKey(str, key) {
       const input = state.currentInput.trim();
       if (input) {
         state.currentInput = '';
+        state.cursorPosition = 0;
+        logUserTurn(input);           // 分割线 + 用户输入入历史
         await runSubSessionCall(input);
       }
       return;
@@ -2756,6 +2837,8 @@ async function handleKey(str, key) {
     if (state.waitingForTask) {
       if (input && !input.startsWith('/')) {
         state.currentInput = '';
+        state.cursorPosition = 0;
+        logUserTurn(input);           // 分割线 + 用户输入入历史
         if (!state.running) await runHorLoop(input);
         return;
       }
@@ -2786,6 +2869,7 @@ async function handleKey(str, key) {
       } else if (input.startsWith('/')) {
         const match = GUIDE_COMMANDS.find(([cmd]) => cmd === input.split(' ')[0]);
         if (match) {
+          logUserTurn(input);         // 分割线 + 用户输入入历史
           executeGuideCommand(input);
         } else {
           state.currentInput = '';
@@ -2795,10 +2879,20 @@ async function handleKey(str, key) {
       } else {
         // 普通文字: 单模型调用 (初始模型直接对话)
         state.currentInput = '';
+        state.cursorPosition = 0;
+        logUserTurn(input);           // 分割线 + 用户输入入历史
         if (!state.running) await runSingleModel(input);
       }
     }
     return;
+  }
+
+  // ---- 历史翻页: PgUp 向上(看更早) / PgDn 向下(回近期) ----
+  if (key.name === 'pageup') {
+    if (!state.running && !state.subSession) { scrollHistory(10); return; }
+  }
+  if (key.name === 'pagedown') {
+    if (!state.running && !state.subSession) { scrollHistory(-10); return; }
   }
 
   // ---- 退格 ----
@@ -2897,6 +2991,9 @@ module.exports = {
     handlePermissionKey,
     grantPermission,
     showPermissionList,
+    logUserTurn,
+    scrollHistory,
+    render: () => render(),
     handleKey: (str, key) => handleKey(str, key),
     handleKeyPublic: (str, key) => handleKey(str, key)
   }
