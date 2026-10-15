@@ -99,14 +99,49 @@ const K = (name, extra = {}) => Object.assign({ name, ctrl: false, meta: false }
   tui.__test.setInput('hello world');
   check('setInput 光标=长度', state.cursorPosition === 11);
 
-  // 10. 渲染中光标位置正确 (cursorX = 4 + cursorPosition)
+  // 10. 渲染中光标位置正确 (cursorX = 4 + 显示宽度)
   tui.__test.setInput('abc');
   state.cursorPosition = 1;
   out = '';
   tui.__test.render();
   // ANSI: 光标绘制序列 \x1b[<row>;<col>H 后面跟 █; col 应为 4+1=5
   const cursorSeq = out.match(/\x1b\[(\d+);(\d+)H\x1b\[38;5;252m█/);
-  check('渲染光标列 = 4+cursorPosition', cursorSeq && parseInt(cursorSeq[2], 10) === 5);
+  check('渲染光标列 = 4+显示宽度 (纯 ASCII)', cursorSeq && parseInt(cursorSeq[2], 10) === 5);
+
+  // 10b. 含中文时光标按显示宽度算列 (每个宽字符 +1 列) — "卡在前一个"的修复验证
+  // 字符串: 中文abc测试 → 显示宽 2+2+1+1+1+2+2 = 11 列, 共 8 字符
+  tui.__test.setInput('中文abc测试');
+  state.cursorPosition = state.currentInput.length;   // 光标在末尾
+  out = '';
+  tui.__test.render();
+  const wideSeq = out.match(/\x1b\[(\d+);(\d+)H\x1b\[38;5;252m█/);
+  // 光标列 = 4 + 11 = 15 (若按字符数算会得 12, 光标卡在前几个字符身上)
+  check('含中文时光标列=4+显示宽度(15)', wideSeq && parseInt(wideSeq[2], 10) === 15);
+
+  // 10c. 中文中间位置: 光标在前 2 字符 (中文) 之后 → 显示宽 4 → 列 8
+  state.cursorPosition = 2;
+  out = '';
+  tui.__test.render();
+  const midSeq = out.match(/\x1b\[(\d+);(\d+)H\x1b\[38;5;252m█/);
+  check('中文中间光标列=4+4=8', midSeq && parseInt(midSeq[2], 10) === 8);
+
+  // 10d. 鼠标点击: 宽字符输入按显示宽度反推索引
+  // '中文abc测试' 显示区间: 中[0,2) 文[2,4) a[4,5) b[5,6) c[6,7) 测[7,9) 试[9,11)
+  // 输入区从列 4 开始 → 列 = 4 + 偏移
+  check('点击列 4 (输入起点) → 索引 0', tui.__test.colToCursorIndex(4, 4) === 0);
+  check('点击列 5 (中右半) → 索引 0', tui.__test.colToCursorIndex(5, 4) === 0);
+  check('点击列 6 (文左半) → 索引 1', tui.__test.colToCursorIndex(6, 4) === 1);
+  check('点击列 7 (文右半) → 索引 1', tui.__test.colToCursorIndex(7, 4) === 1);
+  check('点击列 8 (a 处) → 索引 2', tui.__test.colToCursorIndex(8, 4) === 2);
+  check('点击列 9 (b 处) → 索引 3', tui.__test.colToCursorIndex(9, 4) === 3);
+  check('点击列 10 (c 处) → 索引 4', tui.__test.colToCursorIndex(10, 4) === 4);
+  check('点击列 11 (测左半) → 索引 5', tui.__test.colToCursorIndex(11, 4) === 5);
+  check('点击列 12 (测右半) → 索引 5', tui.__test.colToCursorIndex(12, 4) === 5);
+  check('点击列 13 (试左半) → 索引 6', tui.__test.colToCursorIndex(13, 4) === 6);
+  check('点击列 14 (试右半) → 索引 6', tui.__test.colToCursorIndex(14, 4) === 6);
+  check('点击列 15 (文本末尾) → 索引 7', tui.__test.colToCursorIndex(15, 4) === 7);
+  check('点击超出文本 → 末尾索引 7', tui.__test.colToCursorIndex(999, 4) === 7);
+  check('点击提示符区域 (列 3) → 0', tui.__test.colToCursorIndex(3, 4) === 0);
 
   // 11. 中文输入 (多 code point) 光标正确后移
   tui.__test.setInput('');

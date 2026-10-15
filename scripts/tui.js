@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.5',
+  version: '0.2.6',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -277,6 +277,29 @@ function insertAtCursor(str) {
 function clampCursor() {
   if (state.cursorPosition < 0) state.cursorPosition = 0;
   if (state.cursorPosition > state.currentInput.length) state.cursorPosition = state.currentInput.length;
+}
+
+// ---------- 显示宽度感知的光标定位 ----------
+// 光标之前文本的显示宽度 (中文/全角字符占 2 列, 必须按显示宽度算列号,
+// 否则含中文的输入会把光标画到前几个字符身上 — "卡在前一个"的根因)
+function cursorDisplayOffset() {
+  const before = state.currentInput.slice(0, state.cursorPosition);
+  return displayWidth(before);
+}
+
+// 鼠标点击列号 → 字符索引 (按显示宽度反推)
+function colToCursorIndex(col, inputStartCol) {
+  const s = state.currentInput;
+  const target = col - inputStartCol;   // 点击处在输入区内的显示偏移
+  if (target <= 0) return 0;
+  let w = 0;
+  for (let i = 0; i < s.length; i++) {
+    const cw = displayWidth(s[i]);
+    // 字符 i 占据显示列 [w, w+cw); 点击落在其中 → 光标停到它前面
+    if (target < w + cw) return i;
+    w += cw;
+  }
+  return s.length;
 }
 
 // 把当前活跃会话的状态写入 sessions[idx].snapshot
@@ -895,7 +918,8 @@ function render() {
   }
   // 重新定位光标到正确位置 (光标可能在中间) — 先夹紧防越界
   clampCursor();
-  const cursorX = 2 + prompt.length + state.cursorPosition;
+  // 关键: 按"显示宽度"算列号 (中文宽字符占 2 列), 否则光标会偏在左侧
+  const cursorX = Math.min(2 + prompt.length + cursorDisplayOffset(), W - 1);
   moveCursor(cursorX, inputY);
   process.stdout.write(`${c.text}█${c.reset}`);
 
@@ -2491,12 +2515,10 @@ function handleMouseClick(col, row) {
   if (!state.running && !state.questionnaire && !state.modelsOpen && !state.addStep && !state.pathMode) {
     const inputY = H - 3;
     // render: write(2, inputY, '> ' + input) → 提示符占 2 列 (列 2-3), 输入区从列 4 开始
-    // cursorX = 2 + prompt.length + cursorPosition = 4 + cursorPosition
-    const promptLen = 2;
+    // cursorX = 2 + prompt.length + displayWidth(光标前文本) = 4 + 显示宽度
+    const inputStartCol = 4;
     if (row === inputY && col >= 2) {
-      state.cursorPosition = col - 2 - promptLen;
-      if (state.cursorPosition < 0) state.cursorPosition = 0;
-      if (state.cursorPosition > state.currentInput.length) state.cursorPosition = state.currentInput.length;
+      state.cursorPosition = colToCursorIndex(col, inputStartCol);
       render();
     }
   }
@@ -3185,6 +3207,8 @@ module.exports = {
     setInput,
     insertAtCursor,
     clampCursor,
+    cursorDisplayOffset,
+    colToCursorIndex,
     buildModelContext,
     loadMemory,
     addMemory,
