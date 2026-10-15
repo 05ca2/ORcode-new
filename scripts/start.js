@@ -122,15 +122,19 @@ function loadConfig() {
   }
 }
 
-// 安全调用模型
-async function callModelSafe(role, instruction, config) {
+// 安全调用模型 (context: 可选的对话上下文/记忆, 注入到 prompt 中)
+async function callModelSafe(role, instruction, config, context = '') {
   try {
     const roleConfig = config.positions[role];
     if (!roleConfig) {
       return `[未配置] 岗位 ${role} 没有模型 — 请在设置中添加并分配`;
     }
 
-    const prompt = `作为 ${role}，请执行以下任务：\n${instruction}\n\n[问卷说明] 如果你对任务有不确定之处、需要向用户澄清，可在回复末尾嵌入一份问卷（选项须具体、避免含糊）：\n<<<QUESTIONNAIRE\n{"title":"确认信息","questions":[{"id":"q1","prompt":"问题文本","multi":false,"options":["选项A","选项B"]}]}\nQUESTIONNAIRE>>>\n用户回答后将继续。若无需澄清，直接给出回答即可。`;
+    const contextBlock = context
+      ? `\n\n[上下文] 以下是与你此次任务相关的背景信息 (最近对话与你的记忆)，请翻阅并善用它们：\n${context}\n[上下文结束]`
+      : '';
+
+    const prompt = `作为 ${role}，请执行以下任务：\n${instruction}${contextBlock}\n\n[问卷说明] 如果你对任务有不确定之处、需要向用户澄清，可在回复末尾嵌入一份问卷（选项须具体、避免含糊）：\n<<<QUESTIONNAIRE\n{"title":"确认信息","questions":[{"id":"q1","prompt":"问题文本","multi":false,"options":["选项A","选项B"]}]}\nQUESTIONNAIRE>>>\n用户回答后将继续。若无需澄清，直接给出回答即可。\n\n[记忆说明] 如果用户在对话中透露了值得长期记住的事实 (偏好/项目背景/约定等)，可在回复末尾嵌入记忆块 (可多条)：\n<<<MEMORY\n{"content":"要记住的事实","tags":["偏好"]}\nMEMORY>>>`;
 
     // 本地服务 (ollama/localhost) 不需要 API Key
     const isLocal = roleConfig.provider === 'ollama'

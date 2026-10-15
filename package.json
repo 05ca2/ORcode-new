@@ -1,6 +1,6 @@
 {
   "name": "orcode",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Horizon Loop CLI Agent - Multi-Model Collaboration Framework",
   "main": "orcode.cjs",
   "bin": {

@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.4',
+  version: '0.2.5',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -137,6 +137,10 @@ const GUIDE_COMMANDS = [
   ['/close', 'Close current session tab'],
   ['/archive', 'Save current session transcript to file'],
   ['/perm', 'View and manage path permissions'],
+  ['/remember', 'Save a fact to long-term memory'],
+  ['/memory', 'List saved memories'],
+  ['/forget', 'Delete memories by id or keyword'],
+  ['/context', 'Preview context sent to the model'],
   ['/run', 'Run task (alias of /hor-loop)']
 ];
 
@@ -253,6 +257,28 @@ function expandPath(p) {
   return path.resolve(p);
 }
 
+// ============ 输入框辅助 (光标安全) ============
+// 统一设置输入内容: 光标默认落到末端 (程序化赋值用)
+function setInput(text) {
+  state.currentInput = String(text);
+  state.cursorPosition = state.currentInput.length;
+  if (state.cursorPosition < 0) state.cursorPosition = 0;
+}
+
+// 在光标处插入字符 (主输入模式), 光标随之后移
+function insertAtCursor(str) {
+  if (!str) return;
+  const p = Math.max(0, Math.min(state.cursorPosition, state.currentInput.length));
+  state.currentInput = state.currentInput.slice(0, p) + str + state.currentInput.slice(p);
+  state.cursorPosition = p + str.length;
+}
+
+// 渲染前兜底: 光标夹紧到合法范围 (防止任何路径越界)
+function clampCursor() {
+  if (state.cursorPosition < 0) state.cursorPosition = 0;
+  if (state.cursorPosition > state.currentInput.length) state.cursorPosition = state.currentInput.length;
+}
+
 // 把当前活跃会话的状态写入 sessions[idx].snapshot
 function serializeSession(idx) {
   if (!state.sessions[idx]) return;
@@ -276,8 +302,7 @@ function restoreSession(idx) {
 // 重置当前状态为全新会话 (从 config 继承工作区与岗位模型)
 function applyFreshSession() {
   state.history = [];
-  state.currentInput = '';
-  state.cursorPosition = 0;
+  setInput('');
   state.selectedIndex = 0;
   state.subSession = null;
   state.subSessionLog = [];
@@ -592,6 +617,111 @@ function scrollHistory(delta) {
   if (state.historyScroll !== before) render();
 }
 
+// ============ 模型记忆系统 ============
+// 持久化记忆: ~/.orcode/memory.json — [{id, content, tags, source, createdAt}]
+// 模型可通过回复中嵌入 <<<MEMORY {...} MEMORY>>> 块主动记忆; 用户也可 /remember 手动记忆
+const memoryPath = path.join(configDir, 'memory.json');
+
+function loadMemory() {
+  try {
+    if (fs.existsSync(memoryPath)) {
+      const list = JSON.parse(fs.readFileSync(memoryPath, 'utf-8'));
+      if (Array.isArray(list)) return list;
+    }
+  } catch (e) { /* 损坏则重置 */ }
+  return [];
+}
+
+function saveMemoryStore(list) {
+  try {
+    if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(memoryPath, JSON.stringify(list.slice(-200), null, 2)); // 最多保留 200 条
+    return true;
+  } catch (e) { return false; }
+}
+
+function addMemory(content, tags = [], source = 'manual') {
+  const list = loadMemory();
+  const entry = {
+    id: 'mem-' + crypto.randomUUID().slice(0, 8),
+    content: String(content).slice(0, 500),
+    tags: (Array.isArray(tags) ? tags : []).map(String).slice(0, 6),
+    source,
+    createdAt: new Date().toISOString()
+  };
+  list.push(entry);
+  saveMemoryStore(list);
+  return entry;
+}
+
+function removeMemory(idOrKeyword) {
+  const list = loadMemory();
+  const kw = String(idOrKeyword).toLowerCase();
+  const kept = list.filter(m => m.id !== idOrKeyword && !m.content.toLowerCase().includes(kw));
+  const removed = list.length - kept.length;
+  if (removed > 0) saveMemoryStore(kept);
+  return removed;
+}
+
+// 关键词检索 + 最近记忆 (供上下文注入)
+function searchMemories(query, limit = 5) {
+  const list = loadMemory();
+  if (list.length === 0) return [];
+  const kw = String(query || '').toLowerCase();
+  const words = kw.split(/\s+/).filter(w => w.length >= 2);
+  const scored = list.map((m, idx) => {
+    let score = idx; // 基础分: 越新越高 (后面加的)
+    const hay = (m.content + ' ' + m.tags.join(' ')).toLowerCase();
+    words.forEach(w => { if (hay.includes(w)) score += 10; });
+    return { m, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(s => s.m);
+}
+
+// 从模型回复中提取记忆块: <<<MEMORY {"content":"...","tags":[...]} MEMORY>>>
+function extractMemories(text) {
+  const s = String(text || '');
+  const re = /<<<MEMORY([\s\S]*?)MEMORY>>>/g;
+  const memories = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    try {
+      const obj = JSON.parse(m[1].trim());
+      if (obj && obj.content) memories.push({ content: obj.content, tags: obj.tags || [] });
+    } catch (e) { /* 非法 JSON 忽略 */ }
+  }
+  const cleaned = s.replace(/<<<MEMORY[\s\S]*?MEMORY>>>/g, '').trim();
+  return { cleaned, memories };
+}
+
+// ============ 对话上下文构建 (模型调用前注入) ============
+// 让模型能"翻阅"最近对话并"调用"记忆 — 上下文随指令一起发送
+function buildModelContext(instruction) {
+  const parts = [];
+  // 1. 环境信息
+  parts.push(`[环境] 工作区: ${state.workspaceDir} (工作区内你有完整文件权限; 工作区外需要用户批准)`);
+  // 2. 最近对话 (从历史中提取最近的用户回合, 最多 3 轮)
+  const turns = [];
+  const hist = state.history;
+  for (let i = hist.length - 1; i >= 0 && turns.length < 3; i--) {
+    const line = hist[i];
+    const text = typeof line === 'object' ? line.text : line;
+    if (typeof text === 'string' && text.startsWith('▸ 你:')) {
+      turns.unshift(text);
+    }
+  }
+  if (turns.length > 0) {
+    parts.push(`[最近对话]\n${turns.join('\n')}`);
+  }
+  // 3. 相关记忆 (关键词命中 + 最近)
+  const mems = searchMemories(instruction, 5);
+  if (mems.length > 0) {
+    parts.push(`[你的记忆] (跨会话保存的事实)\n${mems.map(m => `- ${m.content}${m.tags.length ? ` (${m.tags.join(',')})` : ''}`).join('\n')}`);
+  }
+  return parts.join('\n\n');
+}
+
 // ============ 主渲染 ============
 function render() {
   if (!state) return;
@@ -763,7 +893,8 @@ function render() {
   } else {
     write(2, inputY, `${prompt}${placeholder}`, (state.waitingForTask || state.subSession) ? c.accent : c.faint);
   }
-  // 重新定位光标到正确位置 (光标可能在中间)
+  // 重新定位光标到正确位置 (光标可能在中间) — 先夹紧防越界
+  clampCursor();
   const cursorX = 2 + prompt.length + state.cursorPosition;
   moveCursor(cursorX, inputY);
   process.stdout.write(`${c.text}█${c.reset}`);
@@ -934,7 +1065,7 @@ function renderSubSession(mainW, H) {
 function enterSubSession(key) {
   state.subSession = key;
   state.subSessionLog = [];
-  state.currentInput = '';
+  setInput('');
   state.waitingForTask = false;
   state.log(`▸ 进入子会话: ${POSITIONS.find(p => p.key === key)?.label || key}`);
   render();
@@ -945,7 +1076,7 @@ function exitSubSession() {
   const key = state.subSession;
   state.subSession = null;
   state.subSessionLog = [];
-  state.currentInput = '';
+  setInput('');
   if (key) state.log(`◂ 退出子会话: ${POSITIONS.find(p => p.key === key)?.label || key}`);
   render();
 }
@@ -977,7 +1108,7 @@ async function runSubSessionCall(instruction) {
       positions: { [key]: modelEntry }
     });
     try {
-      result = await runModelWithQuestionnaire(key, instruction, singleCfg);
+      result = await runModelWithQuestionnaire(key, instruction, singleCfg, buildModelContext(instruction));
     } catch (e) {
       result = `[错误] ${e.message}`;
     }
@@ -1097,7 +1228,7 @@ function closeModelPanel() {
   state.modelsFilter = '';
   state.modelsIndex = 0;
   state._modelsGeom = null;
-  state.currentInput = '';
+  setInput('');
   render();
 }
 
@@ -1112,7 +1243,7 @@ function applySelectedModel() {
   state.modelsFilter = '';
   state.modelsIndex = 0;
   state._modelsGeom = null;
-  state.currentInput = '';
+  setInput('');
   state.log(`✓ 初始模型已切换: ${m.name} (${m.provider})`);
   render();
 }
@@ -1384,7 +1515,7 @@ function renderQuestionnaire() {
 }
 
 // 模型调用封装: 若回复含问卷则弹出, 收集答案后追加回指令继续 (最多 5 轮)
-async function runModelWithQuestionnaire(role, instruction, cfg) {
+async function runModelWithQuestionnaire(role, instruction, cfg, context = '') {
   let currentInstruction = instruction;
   let finalResult = '';
   state.questionnaireHistory = []; // 清新一届确认历史
@@ -1392,9 +1523,19 @@ async function runModelWithQuestionnaire(role, instruction, cfg) {
   for (let attempt = 0; attempt < 5; attempt++) {
     let result;
     try {
-      result = await callModelSafe(role, currentInstruction, cfg);
+      result = await callModelSafe(role, currentInstruction, cfg, context);
     } catch (e) {
       return `[错误] ${e.message}`;
+    }
+    // 提取模型主动写入的记忆块并持久化
+    const { cleaned: noMem, memories } = extractMemories(result);
+    if (memories.length > 0) {
+      result = noMem;
+      memories.forEach(mem => {
+        addMemory(mem.content, mem.tags, 'model');
+        state.log(`🧠 已记住: ${String(mem.content).slice(0, 60)}${mem.tags.length ? ` [${mem.tags.join(',')}]` : ''}`, c.cyan);
+      });
+      render();
     }
     const { cleaned, q } = extractQuestionnaire(result);
     if (!q) {
@@ -1862,7 +2003,7 @@ async function runSingleModel(instruction) {
 
   let result;
   try {
-    result = await runModelWithQuestionnaire('director', instruction, singleCfg);
+    result = await runModelWithQuestionnaire('director', instruction, singleCfg, buildModelContext(instruction));
   } catch (e) {
     result = `[错误] ${e.message}`;
   }
@@ -1890,7 +2031,7 @@ function startInit() {
   state.needsInit = false;          // 放行 addStep 流程
   state.addStep = 'workspace';
   state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
-  state.currentInput = '';
+  setInput('');
   state.log('◆ 初始化 ORcode — 步骤 0: 输入默认工作区目录 (必填, 如 ~/projects 或 /home/user/projects)');
   render();
 }
@@ -1910,7 +2051,7 @@ function completeInit() {
 
 function startPathMode() {
   state.pathMode = 'workspace';
-  state.currentInput = '';
+  setInput('');
   state.log('◆ 切换工作区 — 输入路径 (enter 确认 · esc 取消)');
   render();
 }
@@ -1958,7 +2099,7 @@ async function archiveSession() {
 async function executeGuideCommand(cmd) {
   const parts = cmd.split(' ');
   const command = parts[0];
-  state.currentInput = '';
+  setInput('');
   state.guideIndex = 0;
 
   switch (command) {
@@ -1981,7 +2122,7 @@ async function executeGuideCommand(cmd) {
       break;
     case '/ask':
     case '/questionnaire':
-      state.currentInput = '';
+      setInput('');
       demoQuestionnaire();
       break;
     case '/hor-loop':
@@ -2009,7 +2150,7 @@ async function executeGuideCommand(cmd) {
         state.modelsOpen = true;
         state.modelsIndex = 0;
         state.modelsFilter = '';
-        state.currentInput = '';
+        setInput('');
         render();
       }
       break;
@@ -2054,6 +2195,51 @@ async function executeGuideCommand(cmd) {
     case '/perm':
       showPermissionList();
       break;
+    case '/remember': {
+      const fact = parts.slice(1).join(' ').trim();
+      if (!fact) {
+        state.log('◍ 用法: /remember <要记住的事实>  (模型也会通过 <<<MEMORY>>> 块自动记忆)');
+        render();
+        break;
+      }
+      const entry = addMemory(fact, [], 'manual');
+      state.log(`🧠 已记住 [${entry.id}]: ${fact}`, c.cyan);
+      render();
+      break;
+    }
+    case '/memory': {
+      const list = loadMemory();
+      if (list.length === 0) {
+        state.log('🧠 记忆为空 — /remember <事实> 手动添加, 或让模型在回复中嵌入 <<<MEMORY>>> 块');
+      } else {
+        state.log(`🧠 记忆库 (${list.length} 条):`, c.cyan);
+        list.slice(-10).forEach(m => {
+          state.log(`  [${m.id}] ${m.content}${m.tags.length ? ` (${m.tags.join(',')})` : ''} · ${m.source}`);
+        });
+      }
+      render();
+      break;
+    }
+    case '/forget': {
+      const kw = parts.slice(1).join(' ').trim();
+      if (!kw) {
+        state.log('◍ 用法: /forget <记忆ID 或 关键词>');
+        render();
+        break;
+      }
+      const n = removeMemory(kw);
+      state.log(n > 0 ? `✓ 已删除 ${n} 条记忆` : '◍ 没有匹配的记忆', n > 0 ? c.green : c.yellow);
+      render();
+      break;
+    }
+    case '/context': {
+      const ctx = buildModelContext(parts.slice(1).join(' ').trim() || '当前任务');
+      state.log('══ 将发送给模型的上下文 ══', c.accent);
+      String(ctx).split('\n').forEach(l => state.log(l));
+      state.log('══ (上下文随指令一起发送, 模型可翻阅) ══', c.accent);
+      render();
+      break;
+    }
     case '/agents':
       state.selectedIndex = (state.selectedIndex + 1) % POSITIONS.length;
       state.log(`▸ 已切换岗位: ${POSITIONS[state.selectedIndex].label}`);
@@ -2069,7 +2255,7 @@ async function executeGuideCommand(cmd) {
 function startAddModel() {
   state.addStep = 'provider';
   state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
-  state.currentInput = '';
+  setInput('');
   state.log('◆ 添加模型 — 步骤 1/5: 输入供应商名称');
   render();
 }
@@ -2077,7 +2263,7 @@ function startAddModel() {
 function cancelAddModel() {
   state.addStep = null;
   state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
-  state.currentInput = '';
+  setInput('');
   state.log('◍ 已取消添加模型');
   render();
 }
@@ -2085,7 +2271,7 @@ function cancelAddModel() {
 function finishAddModel() {
   state.addStep = null;
   state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
-  state.currentInput = '';
+  setInput('');
   state.log('✓ 模型添加完成 — 在设置中按 m 可分配给岗位');
   render();
 }
@@ -2105,7 +2291,7 @@ function confirmAddStep(text) {
       state.config.defaultWorkspaceDir = expandPath(t);
       state.workspaceDir = state.config.defaultWorkspaceDir;
       state.addStep = 'provider';
-      state.currentInput = '';
+      setInput('');
       state.log(`◆ 步骤 1/5: 输入供应商名称 (默认工作区: ${state.config.defaultWorkspaceDir})`);
       break;
     case 'provider':
@@ -2168,7 +2354,7 @@ function confirmAddStep(text) {
       state.log('  回车 = 继续同一供应商 · 空格 = 其他供应商 · s = 完成');
       break;
   }
-  state.currentInput = '';
+  setInput('');
   render();
 }
 
@@ -2304,11 +2490,10 @@ function handleMouseClick(col, row) {
   // 输入框点击: 设置光标位置
   if (!state.running && !state.questionnaire && !state.modelsOpen && !state.addStep && !state.pathMode) {
     const inputY = H - 3;
-    // 输入框位于第二列 (提示符 '> ' 在第二列), 输入从第 4 列开始 (2 + 2)
-    // 计算点击位置在哪个字符处
-    const promptLen = 3; // '> ' 占 2 个字符, 但 border 后至少移到第 2 列? 实际在 render 中 write(2, inputY, ...)
+    // render: write(2, inputY, '> ' + input) → 提示符占 2 列 (列 2-3), 输入区从列 4 开始
+    // cursorX = 2 + prompt.length + cursorPosition = 4 + cursorPosition
+    const promptLen = 2;
     if (row === inputY && col >= 2) {
-      // 2 + prompt.length + cursorPosition => cursorX = col
       state.cursorPosition = col - 2 - promptLen;
       if (state.cursorPosition < 0) state.cursorPosition = 0;
       if (state.cursorPosition > state.currentInput.length) state.cursorPosition = state.currentInput.length;
@@ -2650,8 +2835,7 @@ async function handleKey(str, key) {
     if (key.name === 'return' || key.name === 'enter') {
       const input = state.currentInput.trim();
       if (input) {
-        state.currentInput = '';
-        state.cursorPosition = 0;
+        setInput('');
         logUserTurn(input);           // 分割线 + 用户输入入历史
         await runSubSessionCall(input);
       }
@@ -2660,12 +2844,14 @@ async function handleKey(str, key) {
     // 退格
     if (key.name === 'backspace') {
       state.currentInput = state.currentInput.slice(0, -1);
+      state.cursorPosition = state.currentInput.length;   // 追加型模式: 光标保持末端
       render();
       return;
     }
     // 普通字符输入
     if (str && !key.ctrl && !key.meta) {
       state.currentInput += str;
+      state.cursorPosition = state.currentInput.length;   // 追加型模式: 光标保持末端
       render();
     }
     return;
@@ -2675,7 +2861,7 @@ async function handleKey(str, key) {
   if (state.pathMode === 'workspace') {
     if (key.name === 'escape') {
       state.pathMode = null;
-      state.currentInput = '';
+      setInput('');
       state.log('◍ 已取消切换工作区');
       render();
       return;
@@ -2689,18 +2875,20 @@ async function handleKey(str, key) {
       }
       state.workspaceDir = p;
       state.pathMode = null;
-      state.currentInput = '';
+      setInput('');
       state.log(`✓ 工作区已切换为: ${p}`);
       render();
       return;
     }
     if (key.name === 'backspace') {
       state.currentInput = state.currentInput.slice(0, -1);
+      state.cursorPosition = state.currentInput.length;
       render();
       return;
     }
     if (str && !key.ctrl && !key.meta) {
       state.currentInput += str;
+      state.cursorPosition = state.currentInput.length;
       render();
     }
     return;
@@ -2712,7 +2900,7 @@ async function handleKey(str, key) {
     if (state.addStep === 'afterAdd') {
       if (key.name === 'return' || key.name === 'enter') {
         state.addStep = 'modelId';      // 继续同一供应商 (保留 provider/baseUrl/key)
-        state.currentInput = '';
+        setInput('');
         state.log('◆ 继续添加 — 步骤 4/5: 输入模型 ID (同一供应商)');
         render();
         return;
@@ -2720,7 +2908,7 @@ async function handleKey(str, key) {
       if (str === ' ') {                 // 空格 → 其他供应商
         state.addStep = 'provider';
         state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
-        state.currentInput = '';
+        setInput('');
         state.log('◆ 添加其他供应商模型 — 步骤 1/5: 输入供应商名称');
         render();
         return;
@@ -2744,11 +2932,13 @@ async function handleKey(str, key) {
     }
     if (key.name === 'backspace') {
       state.currentInput = state.currentInput.slice(0, -1);
+      state.cursorPosition = state.currentInput.length;   // 追加型模式: 光标保持末端
       render();
       return;
     }
     if (str && !key.ctrl && !key.meta) {
       state.currentInput += str;   // 输入步骤允许空格 (如 "DeepSeek V3")
+      state.cursorPosition = state.currentInput.length;   // 追加型模式: 光标保持末端
       render();
     }
     return;
@@ -2773,7 +2963,7 @@ async function handleKey(str, key) {
 
   // ---- ctrl+p 命令面板 (输入 /) ----
   if (key.ctrl && key.name === 'p' && !state.running) {
-    state.currentInput = '/';
+    setInput('/');                 // 光标落到 '/' 之后
     state.guideIndex = 0;
     state.waitingForTask = false;
     render();
@@ -2793,7 +2983,7 @@ async function handleKey(str, key) {
 
   // ---- Esc 清空输入 / 取消等待 ----
   if (key.name === 'escape') {
-    state.currentInput = '';
+    setInput('');                  // 同时重置光标, 防止残留越位
     state.guideIndex = 0;
     state.waitingForTask = false;
     render();
@@ -2815,7 +3005,7 @@ async function handleKey(str, key) {
       if (filtered.length > 0) {
         executeGuideCommand(filtered[state.guideIndex][0]);
       } else {
-        state.currentInput = '';
+        setInput('');
         render();
       }
       return;
@@ -2836,8 +3026,7 @@ async function handleKey(str, key) {
     // /hor-loop 待命状态: 输入任务即启动
     if (state.waitingForTask) {
       if (input && !input.startsWith('/')) {
-        state.currentInput = '';
-        state.cursorPosition = 0;
+        setInput('');
         logUserTurn(input);           // 分割线 + 用户输入入历史
         if (!state.running) await runHorLoop(input);
         return;
@@ -2872,14 +3061,13 @@ async function handleKey(str, key) {
           logUserTurn(input);         // 分割线 + 用户输入入历史
           executeGuideCommand(input);
         } else {
-          state.currentInput = '';
+          setInput('');
           state.log(`◍ 未知命令: ${input.split(' ')[0]} — 输入 / 查看命令面板`);
           render();
         }
       } else {
         // 普通文字: 单模型调用 (初始模型直接对话)
-        state.currentInput = '';
-        state.cursorPosition = 0;
+        setInput('');
         logUserTurn(input);           // 分割线 + 用户输入入历史
         if (!state.running) await runSingleModel(input);
       }
@@ -2929,9 +3117,9 @@ async function handleKey(str, key) {
     }
   }
 
-  // ---- 普通字符 ----
+  // ---- 普通字符 (插入到光标处, 光标随后移 — 修复"光标不跟随/卡住") ----
   if (str && !key.ctrl && !key.meta && !state.running) {
-    state.currentInput += str;
+    insertAtCursor(str);
     render();
   }
 }
@@ -2994,6 +3182,15 @@ module.exports = {
     logUserTurn,
     scrollHistory,
     render: () => render(),
+    setInput,
+    insertAtCursor,
+    clampCursor,
+    buildModelContext,
+    loadMemory,
+    addMemory,
+    removeMemory,
+    searchMemories,
+    extractMemories,
     handleKey: (str, key) => handleKey(str, key),
     handleKeyPublic: (str, key) => handleKey(str, key)
   }
