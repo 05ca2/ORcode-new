@@ -46,7 +46,7 @@ if (args.length === 0) {
     process.exit(1);
   });
 } else if (args.includes('--version') || args.includes('-v')) {
-  console.log('orcode 0.2.2');
+  console.log('orcode 0.2.3');
 } else if (args.includes('--help') || args.includes('-h')) {
   console.log(`
 ORcode - Holy Open Relay 命令行智能体

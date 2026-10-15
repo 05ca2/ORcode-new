@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.2',
+  version: '0.2.3',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -25,6 +25,7 @@ const defaultConfig = {
   workspaceDir: homePath,
   defaultWorkspaceDir: null,   // 初始化时填写的默认工作区 (新会话继承此值)
   initialized: false,          // 是否已初始化 (orcode init 后变为 true)
+  pathPermissions: {},         // 持久化的路径授权: { 绝对路径: 'full' | 'read' | 'denied' }
   apiKeys: {}
 };
 
@@ -39,6 +40,7 @@ function loadConfig() {
     if (!cfg.models) cfg.models = [];
     if (!cfg.positions) cfg.positions = {};
     if (!cfg.apiKeys) cfg.apiKeys = {};
+    if (!cfg.pathPermissions) cfg.pathPermissions = {};
     if (!cfg.defaultWorkspaceDir) cfg.defaultWorkspaceDir = cfg.workspaceDir || null;
     if (typeof cfg.initialized !== 'boolean') cfg.initialized = false;
     if (!cfg.defaultModel) {
@@ -134,6 +136,7 @@ const GUIDE_COMMANDS = [
   ['/new', 'Open a new session tab'],
   ['/close', 'Close current session tab'],
   ['/archive', 'Save current session transcript to file'],
+  ['/perm', 'View and manage path permissions'],
   ['/run', 'Run task (alias of /hor-loop)']
 ];
 
@@ -144,10 +147,12 @@ class TUIState {
     this.positions = {};
     this.history = [];
     this.currentInput = '';
+    this.cursorPosition = 0; // 光标位置 (字符索引)
     this.selectedIndex = 0;
     this.guideIndex = 0;
     this.settingsOpen = false;
     this.settingsPos = 0;
+    this.settingsScroll = 0; // 设置面板内滚动偏移
     // 添加模型五步流程: provider → baseUrl → apiKey → modelId → displayName → afterAdd
     this.addStep = null;
     this.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
@@ -180,6 +185,12 @@ class TUIState {
     this.needsInit = !this.config.initialized;
     this.initMode = false;         // 内联初始化进行中
     this.pathMode = null;          // 'workspace' = 正在输入路径以切换工作区
+
+    // 权限管理: 工作区内 full, 跨工作区需申请
+    // permissions: { [绝对路径]: 'full' | 'read' | 'write' | 'denied', default: 'denied' }
+    this.permissions = Object.assign({}, this.config.pathPermissions || {}, { default: 'denied' });
+    this.permissionRequest = null;  // 待确认的权限申请: {path, action, reason, resolve}
+    this._permGeom = null;         // 权限面板几何信息 (鼠标用)
 
     POSITIONS.forEach(p => {
       this.positions[p.key] = {
@@ -227,9 +238,9 @@ class TUIState {
 // ============ 多会话 (浏览器式标签) 管理 ============
 // 每会话独立的状态字段 — 切换时整体序列化/恢复
 const SESSION_FIELDS = [
-  'workspaceDir', 'history', 'currentInput', 'selectedIndex',
+  'workspaceDir', 'history', 'currentInput', 'cursorPosition', 'selectedIndex',
   'subSession', 'subSessionLog', 'running', 'activePos',
-  'sessionId', 'tokens', 'positions'
+  'sessionId', 'tokens', 'positions', 'permissions'
 ];
 
 function expandPath(p) {
@@ -263,6 +274,7 @@ function restoreSession(idx) {
 function applyFreshSession() {
   state.history = [];
   state.currentInput = '';
+  state.cursorPosition = 0;
   state.selectedIndex = 0;
   state.subSession = null;
   state.subSessionLog = [];
@@ -271,6 +283,10 @@ function applyFreshSession() {
   state.sessionId = null;
   state.tokens = 0;
   state.workspaceDir = state.config.defaultWorkspaceDir || state.config.workspaceDir || homePath;
+  // 初始化权限系统：从配置加载已授权的路径, 工作区内默认 full
+  state.permissions = Object.assign({}, state.config.pathPermissions || {}, { default: 'denied' });
+  state.permissionRequest = null;
+  state._permGeom = null;
   const positions = {};
   POSITIONS.forEach(p => {
     positions[p.key] = {
@@ -307,6 +323,15 @@ function switchSession(idx) {
 }
 
 function closeSession(idx) {
+  // 调试日志
+  console.error('[DEBUG] closeSession 调用:', {
+    idx,
+    activeIndex: state.activeIndex,
+    sessionCount: state.sessions.length,
+    running: state.running,
+    questionnaire: !!state.questionnaire
+  });
+
   if (state.sessions.length <= 1) {
     state.log('◍ 至少要保留一个会话');
     render();
@@ -386,6 +411,164 @@ function getStatusColor(status) {
   return { idle: c.faint, thinking: c.yellow, working: c.accent, completed: c.green, error: c.red }[status] || c.faint;
 }
 
+// ============ 权限管理 ============
+// 权限级别: 'full' 完整 (读/写/执行) · 'read' 只读 · 'denied' 拒绝
+// 规则: 当前工作区目录内默认 full; 工作区外一律 denied, 需用户批准
+
+function normalizePath(p) {
+  if (!p) return '';
+  if (p === '~') return homePath;
+  if (p.startsWith('~/')) return path.join(homePath, p.slice(2));
+  return path.resolve(p);
+}
+
+// 判断目标路径是否在当前工作区内 (含自身)
+function isInsideWorkspace(p) {
+  const target = normalizePath(p);
+  const ws = normalizePath(state.workspaceDir);
+  if (!target || !ws) return false;
+  const rel = path.relative(ws, target);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function getPermission(p) {
+  const target = normalizePath(p);
+  if (isInsideWorkspace(target)) return 'full';   // 工作区内: 完整权限
+  return state.permissions[target] || state.permissions['default'] || 'denied';
+}
+
+// 保存单条权限到配置 (持久化, 跨会话生效)
+function grantPermission(p, level) {
+  const target = normalizePath(p);
+  if (!target) return;
+  state.permissions[target] = level;
+  const cfg = state.config;
+  if (!cfg.pathPermissions) cfg.pathPermissions = {};
+  cfg.pathPermissions[target] = level;
+  saveConfig(cfg);
+}
+
+// 弹出权限申请面板 (Y=同意 · N=拒绝 · E=本次授权/仅这次)
+function requestPermission(p, action = 'read', reason = '') {
+  const target = normalizePath(p);
+  return new Promise(resolve => {
+    state.permissionRequest = {
+      path: target,
+      action,             // read | write | execute
+      reason,
+      resolve
+    };
+    state.log(`⚠ 权限申请 · ${target} (${action === 'write' ? '写入' : action === 'execute' ? '执行' : '读取'})`, c.yellow);
+    render();
+  });
+}
+
+// 用户在面板中确认后调用
+function resolvePermissionRequest(choice) {
+  const req = state.permissionRequest;
+  if (!req) return;
+  state.permissionRequest = null;
+  state._permGeom = null;
+  if (choice === 'Y') {
+    grantPermission(req.path, req.action === 'read' ? 'read' : 'full');
+    state.log(`✓ 已授权: ${req.path} → ${req.action === 'read' ? '只读' : '完整'}`, c.green);
+    req.resolve(true);
+  } else if (choice === 'E') {
+    // 仅本次授权, 不持久化
+    state.log(`◐ 本次授权: ${req.path} (仅当前任务有效)`, c.yellow);
+    req.resolve(true);
+  } else {
+    state.log(`✗ 已拒绝: ${req.path}`, c.red);
+    req.resolve(false);
+  }
+  render();
+}
+
+// 对外统一入口: 需要访问路径时调用, 工作区内直接放行, 工作区外弹面板
+async function checkPathPermission(p, action = 'read', reason = '') {
+  const perm = getPermission(p);
+  if (perm === 'full' || (perm === 'read' && action === 'read')) return true;
+  if (perm === 'denied') {
+    return await requestPermission(p, action, reason);
+  }
+  // perm === 'read' 但请求 write/execute → 需升级授权
+  return await requestPermission(p, action, reason || '需要更高权限 (当前: 只读)');
+}
+
+// 权限申请面板键盘处理
+function handlePermissionKey(str, key) {
+  const req = state.permissionRequest;
+  if (!req) return false;
+  if (key.name === 'escape' || str === 'e' || str === 'E') {
+    // E = 仅本次授权; Esc = 拒绝
+    if (key.name === 'escape') { resolvePermissionRequest('N'); return true; }
+    resolvePermissionRequest('E'); return true;
+  }
+  if (str === 'y' || str === 'Y') { resolvePermissionRequest('Y'); return true; }
+  if (str === 'n' || str === 'N') { resolvePermissionRequest('N'); return true; }
+  return true;   // 拦截其它键, 防止泄漏到输入框
+}
+
+// 渲染权限申请面板 (居中对话框)
+function renderPermissionPanel() {
+  const req = state.permissionRequest;
+  if (!req) return;
+  const W = state.terminalWidth, H = state.terminalHeight;
+  const pw = Math.min(60, W - 8);
+  const lines = [
+    '智能体请求访问工作区之外的路径',
+    '',
+    `路径:   ${req.path}`,
+    `操作:   ${req.action === 'write' ? '写入 (write)' : req.action === 'execute' ? '执行 (execute)' : '读取 (read)'}`,
+    `原因:   ${req.reason || '完成任务需要访问该资源'}`,
+    '',
+    '是否授予权限?',
+    '  Y = 同意并记住 (写入配置)',
+    '  E = 仅本次授权 (不写入配置)',
+    '  N / Esc = 拒绝'
+  ];
+  const ph = lines.length + 2;
+  const px = Math.max(2, Math.floor((W - pw) / 2));
+  const py = Math.max(1, Math.floor((H - ph) / 2));
+
+  for (let i = 0; i < ph; i++) { moveCursor(px, py + i); process.stdout.write(' '.repeat(pw)); }
+  moveCursor(px, py);
+  process.stdout.write(`${c.border}╭─ 权限申请 ${'─'.repeat(Math.max(0, pw - 14))}╮${c.reset}`);
+  for (let i = 1; i < ph - 1; i++) {
+    moveCursor(px, py + i);
+    process.stdout.write(`${c.border}│${c.reset}`);
+    moveCursor(px + pw - 1, py + i);
+    process.stdout.write(`${c.border}│${c.reset}`);
+  }
+  lines.forEach((ln, i) => {
+    const color = i === 0 ? c.yellow : (ln.startsWith('  Y') ? c.green : ln.startsWith('  N') ? c.red : c.text);
+    moveCursor(px + 2, py + 1 + i);
+    process.stdout.write(`${color}${truncateAnsi(ln, pw - 4)}${c.reset}`);
+  });
+  moveCursor(px, py + ph - 1);
+  process.stdout.write(`${c.border}╰${'─'.repeat(pw - 2)}╯${c.reset}`);
+  state._permGeom = { px, py, pw, ph };
+}
+
+// 显示当前权限列表 (/perm)
+function showPermissionList() {
+  const ws = normalizePath(state.workspaceDir);
+  state.log('══ 权限概览 ══', c.accent);
+  state.log(`▸ 工作区: ${ws} → 🔓 完整权限 (读/写/执行)`, c.green);
+  const entries = Object.entries(state.permissions).filter(([k]) => k !== 'default');
+  if (entries.length === 0) {
+    state.log('▸ 暂无额外授权的区外路径', c.sub);
+  } else {
+    entries.forEach(([p, lvl]) => {
+      const icon = lvl === 'full' ? '🔓' : lvl === 'read' ? '👁' : '🔒';
+      const label = lvl === 'full' ? '完整' : lvl === 'read' ? '只读' : '拒绝';
+      state.log(`▸ ${p} → ${icon} ${label}`, lvl === 'denied' ? c.red : c.text);
+    });
+  }
+  state.log('· 默认策略: 工作区外访问需申请 (Y 记住 / E 仅本次 / N 拒绝)', c.faint);
+  render();
+}
+
 // ============ 主渲染 ============
 function render() {
   if (!state) return;
@@ -414,8 +597,10 @@ function render() {
 
   // ---------- 左上: 路径与当前岗位 ----------
   const wsDir = state.workspaceDir || '~';
+  const grantedCount = Object.keys(state.permissions).filter(k => k !== 'default' && state.permissions[k] !== 'denied').length;
   write(2, 8, `${wsDir}`, c.text);
   write(2, 9, `当前岗位: ${POSITIONS[state.selectedIndex].label}`, c.sub);
+  write(2, 10, `🔓 工作区内: 完整权限${grantedCount > 0 ? ` · 🔑 已授权区外路径: ${grantedCount}` : ''}`, c.green);
 
   // ---------- 粉色分割线 (明显) ----------
   for (let y = 2; y <= H - 5; y++) {
@@ -509,6 +694,7 @@ function render() {
   else if (state.subSession) placeholder = `子会话 · ${POSITIONS.find(p => p.key === state.subSession)?.label || ''} — 直接输入用该岗位模型执行 · Esc 返回`;
   else if (state.modelsOpen) placeholder = '模型选择中 · ↑↓/鼠标悬停选择 · 输入字符过滤 · enter 确认 · esc 关闭';
   else if (state.questionnaire) placeholder = '问卷回答中 · ↑↓ 切换 · 空格 勾选/选择 · enter 提交 · esc 跳过';
+  else if (state.permissionRequest) placeholder = '权限申请中 · Y 同意并记住 · E 仅本次授权 · N/Esc 拒绝';
   else if (state.pathMode === 'workspace') placeholder = '切换工作区 · 输入路径 (enter 确认 · esc 取消)';
   else if (state.waitingForTask) placeholder = '输入任务内容，回车启动 HOR-loop 多模型工作流';
   else if (state.currentInput) placeholder = '';
@@ -518,7 +704,8 @@ function render() {
   } else {
     write(2, inputY, `${prompt}${placeholder}`, (state.waitingForTask || state.subSession) ? c.accent : c.faint);
   }
-  const cursorX = 2 + prompt.length + state.currentInput.length;
+  // 重新定位光标到正确位置 (光标可能在中间)
+  const cursorX = 2 + prompt.length + state.cursorPosition;
   moveCursor(cursorX, inputY);
   process.stdout.write(`${c.text}█${c.reset}`);
 
@@ -528,7 +715,8 @@ function render() {
   process.stdout.write(`${c.border}${'─'.repeat(W - 1)}${c.reset}`);
   const mode = state.running ? 'running' : (state.waitingForTask ? 'awaiting' : 'idle');
   const defaultName = cfg.defaultModel?.name || '未配置模型';
-  const left = `${defaultName} · ${state.workspaceDir || '~'} · ${mode} · 会话 ${state.activeIndex + 1}/${state.sessions.length}`;
+  const permBadge = state.permissionRequest ? '⏳ 权限申请中' : '🔓 工作区权限';
+  const left = `${defaultName} · ${state.workspaceDir || '~'} · ${permBadge} · ${mode} · 会话 ${state.activeIndex + 1}/${state.sessions.length}`;
   const right = `Ctrl+T 新会话 · Ctrl+W 关闭 · Ctrl+1-9 切换`;
   moveCursor(2, barY);
   process.stdout.write(`${c.sub}${truncateAnsi(left, divX - 4)}${c.reset}`);
@@ -547,6 +735,9 @@ function render() {
 
   // ---------- 智能体问卷面板 ----------
   if (state.questionnaire) renderQuestionnaire();
+
+  // ---------- 权限申请面板 (最高层级) ----------
+  if (state.permissionRequest) renderPermissionPanel();
 
   // ---------- 设置面板 ----------
   if (state.settingsOpen) renderSettingsPanel();
@@ -890,14 +1081,21 @@ function extractQuestionnaire(text) {
 }
 
 function normalizeQuestionnaire(raw) {
-  const q = { title: raw.title || '需要你的确认', questions: [], qIndex: 0, optIndex: 0, selections: {} };
+  const q = { title: raw.title || '需要你的确认', questions: [], qIndex: 0, optIndex: 0, selections: {}, freeText: {} };
   (raw.questions || []).forEach((qu, i) => {
     if (!qu || !qu.prompt || !Array.isArray(qu.options) || qu.options.length === 0) return;
+    // 支持添加"其他"自定义输入选项
+    const options = qu.options.map(String);
+    // 如果模型指定了 allowFreeText，则添加自定义输入选项
+    if (qu.allowFreeText) {
+      options.push('※ 由用户自行输入答案 ※');
+    }
     q.questions.push({
       id: qu.id || ('q' + i),
       prompt: String(qu.prompt),
       multi: !!qu.multi,
-      options: qu.options.map(String)
+      allowFreeText: !!qu.allowFreeText,
+      options: options
     });
   });
   return q;
@@ -948,15 +1146,36 @@ function showQuestionnaire(qData) {
   if (q.questions.length === 0) return Promise.resolve([]);
   state.questionnaire = q;
   state.questionnaireResolve = null;
+  // 保留问答历史，用于显示确认信息
+  if (!state.questionnaireHistory) state.questionnaireHistory = [];
+  state.questionnaireHistory = []; // 清出新的一次
   render();
   return new Promise(res => { state.questionnaireResolve = res; });
 }
 
 function resolveQuestionnaire(answers) {
   const r = state.questionnaireResolve;
+  // 保存确认历史信息
+  if (answers && state.questionnaire) {
+    const confirmation = {
+      title: state.questionnaire.title,
+      questions: state.questionnaire.questions.map(q => {
+        const answersForQ = answers.find(a => a.id === q.id);
+        return {
+          prompt: q.prompt,
+          answer: answersForQ ? answersForQ.answers.join('、') : '(用户未选择)',
+          freeText: state.questionnaire.freeText && state.questionnaire.freeText[q.id]
+        };
+      })
+    };
+    if (!state.questionnaireHistory) state.questionnaireHistory = [];
+    state.questionnaireHistory.push(confirmation);
+  }
+
   state.questionnaire = null;
   state.questionnaireResolve = null;
   state._qGeom = null;
+  state.freeTextInput = false;
   render();
   if (r) r(answers);
 }
@@ -964,19 +1183,79 @@ function resolveQuestionnaire(answers) {
 function handleQuestionnaireKey(str, key) {
   const q = state.questionnaire;
   if (!q) return;
-  if (key.name === 'escape') { resolveQuestionnaire(null); return; }       // 跳过
-  if (key.name === 'return' || key.name === 'enter') { resolveQuestionnaire(collectAnswers(q)); return; }
-  if (key.name === 'up') { moveQCursor(-1); render(); return; }
-  if (key.name === 'down') { moveQCursor(1); render(); return; }
+
+  // 自定义输入模式
+  const currentQ = q.questions[q.qIndex];
+  const hasFreeText = currentQ.allowFreeText && (q.selections[currentQ.id] || []).includes(currentQ.options.length - 1);
+
+  if (hasFreeText) {
+    // 在自由文本输入模式下
+    if (key.name === 'escape') {
+      // esc 退出自由文本输入，但不关闭问卷
+      state.freeTextInput = false;
+      render();
+      return;
+    }
+    if (key.name === 'return' || key.name === 'enter') {
+      // 回车直接提交问卷
+      state.freeTextInput = false;
+      resolveQuestionnaire(collectAnswers(q));
+      return;
+    }
+    if (key.name === 'backspace') {
+      // 删除自由文本
+      q.freeText = q.freeText || {};
+      q.freeText[currentQ.id] = q.freeText[currentQ.id].slice(0, -1);
+      render();
+      return;
+    }
+    if (str && !key.ctrl && !key.meta) {
+      // 输入自定义文本
+      q.freeText = q.freeText || {};
+      q.freeText[currentQ.id] += str;
+      render();
+      return;
+    }
+    // 注意：在自由文本模式下，其他键不响应，避免干扰文本输入
+    return;
+  }
+
+  // 正常问卷模式
+  if (key.name === 'escape') {
+    resolveQuestionnaire(null);
+    return;
+  }
+  if (key.name === 'return' || key.name === 'enter') {
+    resolveQuestionnaire(collectAnswers(q));
+    return;
+  }
+  if (key.name === 'up') {
+    moveQCursor(-1);
+    render();
+    return;
+  }
+  if (key.name === 'down') {
+    moveQCursor(1);
+    render();
+    return;
+  }
   if (key.name === 'left') {
     const qu = q.questions[q.qIndex];
-    q.optIndex = Math.max(0, q.optIndex - 1); render(); return;
+    q.optIndex = Math.max(0, q.optIndex - 1);
+    render();
+    return;
   }
   if (key.name === 'right') {
     const qu = q.questions[q.qIndex];
-    q.optIndex = Math.min(qu.options.length - 1, q.optIndex + 1); render(); return;
+    q.optIndex = Math.min(qu.options.length - 1, q.optIndex + 1);
+    render();
+    return;
   }
-  if (str === ' ') { questionnaireToggle(); render(); return; }
+  if (str === ' ') {
+    questionnaireToggle();
+    render();
+    return;
+  }
 }
 
 function renderQuestionnaire() {
@@ -1024,9 +1303,24 @@ function renderQuestionnaire() {
     });
     ry++;
   });
+  // 检查当前问题是否选择了自定义输入选项
+  const currentQ = qn[q.qIndex];
+  const hasFreeTextSelection = currentQ.allowFreeText && (q.selections[currentQ.id] || []).includes(currentQ.options.length - 1);
+  if (hasFreeTextSelection) {
+    // 显示自定义输入提示
+    moveCursor(px + 2, ry);
+    process.stdout.write(`${c.accent}请输入你的自定义答案:${c.reset}`);
+    ry++;
+    // 显示当前输入内容 (如果有)
+    if (q.freeText[currentQ.id]) {
+      moveCursor(px + 2, ry);
+      process.stdout.write(`${c.faint}当前内容: ${q.freeText[currentQ.id]}${c.reset}`);
+      ry++;
+    }
+  }
   moveCursor(px + 2, ry);
   const multi = qn.some(x => x.multi);
-  process.stdout.write(`${c.faint}↑↓ 切换 · 空格 ${multi ? '勾选' : '选择'} · enter 提交 · esc 跳过${c.reset}`);
+  process.stdout.write(`${c.faint}↑↓ 切换 · 空格 ${multi ? '勾选' : '选择'} · Enter 提交 · Esc 跳过${c.reset}`);
   state._qGeom = { px, py, pw, ph, rows };
 }
 
@@ -1034,6 +1328,8 @@ function renderQuestionnaire() {
 async function runModelWithQuestionnaire(role, instruction, cfg) {
   let currentInstruction = instruction;
   let finalResult = '';
+  state.questionnaireHistory = []; // 清新一届确认历史
+
   for (let attempt = 0; attempt < 5; attempt++) {
     let result;
     try {
@@ -1047,6 +1343,8 @@ async function runModelWithQuestionnaire(role, instruction, cfg) {
       break;
     }
     if (cleaned && cleaned.trim()) state.log(`  ${cleaned.trim()}`, c.sub);
+
+    // 显示待确认问题
     state.log(`◆ 需要向你确认 (${q.questions.length} 个问题)` + (q.title ? ` · ${q.title}` : ''), c.accent);
     const answers = await showQuestionnaire(q);
     if (!answers) {
@@ -1054,9 +1352,22 @@ async function runModelWithQuestionnaire(role, instruction, cfg) {
       finalResult = (cleaned && cleaned.trim()) ? cleaned : result;
       break;
     }
+
+    // 显示确认结果（保留在界面上）
+    state.log(`□ 已确认信息:`);
     answers.forEach(a => {
-      state.log(`  ↳ ${a.prompt}: ${a.answers.length ? a.answers.join('、') : '(未选择)'}`, c.green);
+      // 检查是否有自由文本
+      const freeText = state.questionnaireHistory && state.questionnaireHistory[state.questionnaireHistory.length - 1] &&
+                       state.questionnaireHistory[state.questionnaireHistory.length - 1].questions.find(qt => qt.prompt === a.prompt && qt.freeText);
+      const txt = a.answers.length ? a.answers.join('、') + (freeText ? ` + "${freeText.freeText}"` : '') : '(未选择)';
+      state.log(`  ↳ ${a.prompt}: ${txt}`, c.green);
     });
+
+    // 添加子会话推理步骤
+    state.log(`◎ 推理过程: 模型检测到需要确认的信息，通过问卷收集用户反馈`);
+    state.log(`  子模型思考: 识别到多义性风险，请求用户澄清`);
+
+    // 更新指令，继续任务
     currentInstruction = buildAnswerInstruction(instruction, answers);
   }
   return finalResult;
@@ -1133,7 +1444,12 @@ function renderSettingsPanel() {
   const px = Math.max(4, Math.floor((W - Math.max(30, Math.floor(W * 0.34))) * 0.5) - Math.floor(pw / 2));
   const py = Math.max(1, Math.floor((H - ph) / 2));
 
-  // 面板背景 + 边框
+  // 计算可滚动区域
+  const contentRows = adding ? 22 : 15; // 内容总行数的近似值 (不含标题/边框)
+  const maxScroll = Math.max(0, contentRows - (ph - 5)); // 减去标题和底部提示的高度
+  state.settingsScroll = Math.min(maxScroll, Math.max(0, state.settingsScroll));
+
+  // 面板背景 + 边框 (清屏)
   for (let i = 0; i < ph; i++) {
     moveCursor(px, py + i);
     process.stdout.write(`${' '.repeat(pw)}`);
@@ -1151,92 +1467,176 @@ function renderSettingsPanel() {
     process.stdout.write(`${c.border}│${c.reset}`);
   }
 
-  let ry = py + 2;
-  // 并行 Workers 数量
-  moveCursor(px + 3, ry);
-  process.stdout.write(`${c.text}并行 Workers 数量${c.reset}`);
-  moveCursor(px + pw - 14, ry);
-  process.stdout.write(`${c.faint}< ${c.accent}${cfg.workers}${c.faint} >${c.reset}`);
-  ry++;
-  // 验证轮数
-  moveCursor(px + 3, ry);
-  process.stdout.write(`${c.text}验证轮数${c.reset}`);
-  moveCursor(px + pw - 14, ry);
-  process.stdout.write(`${c.faint}< ${c.accent}${cfg.verifyRounds}${c.faint} >${c.reset}`);
-  ry++;
-  // 初始模型
-  moveCursor(px + 3, ry);
-  process.stdout.write(`${c.text}初始模型 (d 更换)${c.reset}`);
-  moveCursor(px + pw - 20, ry);
-  process.stdout.write(`${c.accent}${truncateAnsi(cfg.defaultModel?.name || '-', 14)}${c.reset}`);
-  ry += 2;
-
-  // 岗位模型
-  moveCursor(px + 3, ry);
-  process.stdout.write(`${c.sub}岗位模型 (tab 切换 · m 更换模型)${c.reset}`);
-  ry++;
-  POSITIONS.forEach((p, idx) => {
-    const sel = state.settingsPos === idx;
-    const marker = sel ? '▸' : ' ';
-    // 显示内存中的实时值 (m 键切换后立即反映)
-    const model = state.positions[p.key]?.model || cfg.positions[p.key]?.name || '-';
-    moveCursor(px + 3, ry);
-    if (sel) {
-      process.stdout.write(`${c.accent}${marker} ${p.key.padEnd(10)}${c.text}${model}${c.reset}`);
-    } else {
-      process.stdout.write(`${c.faint}${marker} ${p.key.padEnd(10)}${c.sub}${model}${c.reset}`);
+  // 滚动条绘制 (位于面板内部右边缘，确保不超出边界)
+  const scrollbarCol = px + pw - 4; // 就在右边框内侧一格
+  const scrollTrackHeight = ph - 5; // 滚动区域高度
+  const scrollVisible = maxScroll > 0;
+  if (scrollVisible) {
+    // 计算滚动滑块大小和位置
+    const ratio = (ph - 5) / contentRows;
+    const thumbHeight = Math.max(1, Math.floor((ph - 5) * ratio));
+    // 滚动轨道
+    for (let i = 0; i < scrollTrackHeight; i++) {
+      moveCursor(scrollbarCol, py + 2 + i);
+      process.stdout.write(`${c.border}│${c.reset}`);
     }
+    // 滚动滑块 (根据滚动位置动态调整)
+    const thumbStart = Math.floor((state.settingsScroll / maxScroll) * (scrollTrackHeight - thumbHeight));
+    for (let i = 0; i < thumbHeight; i++) {
+      moveCursor(scrollbarCol, py + 2 + thumbStart + i);
+      process.stdout.write(`${c.accent}█${c.reset}`);
+    }
+  }
+
+  let ry = py + 2;
+
+  // 由于滚动, 实际绘制从 state.settingsScroll 开始
+  const visibleStart = state.settingsScroll;
+
+  // 并行 Workers 数量 (row 0)
+  if (visibleStart <= 0) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.text}并行 Workers 数量${c.reset}`);
+    moveCursor(px + pw - 14, ry);
+    process.stdout.write(`${c.faint}< ${c.accent}${cfg.workers}${c.faint} >${c.reset}`);
     ry++;
+  }
+  // 验证轮数 (row 1)
+  if (visibleStart <= 1) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.text}验证轮数${c.reset}`);
+    moveCursor(px + pw - 14, ry);
+    process.stdout.write(`${c.faint}< ${c.accent}${cfg.verifyRounds}${c.faint} >${c.reset}`);
+    ry++;
+  }
+  // 提示 (row 2) - 仅在非添加模式
+  if (!adding && visibleStart <= 2) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.faint}(提示：-/+ 改Workers, [] 改轮数, d 改初始模型, a 添加模型)${c.reset}`);
+    ry++;
+  }
+  // 初始模型 (row 3)
+  if (visibleStart <= 3) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.text}初始模型 (d 更换)${c.reset}`);
+    moveCursor(px + pw - 20, ry);
+    process.stdout.write(`${c.accent}${truncateAnsi(cfg.defaultModel?.name || '-', 14)}${c.reset}`);
+    ry++;
+  }
+  ry += 1; // 空行
+
+  // 岗位模型标题 (row 5)
+  if (visibleStart <= 5) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.sub}岗位模型 (tab 切换 · m 更换模型)${c.reset}`);
+    ry++;
+  }
+  // 岗位列表 (rows 6-9) - 跳过 4 个岗位
+  POSITIONS.forEach((p, idx) => {
+    if (visibleStart <= 6 + idx && visibleStart > 5 + idx) {
+      const sel = state.settingsPos === idx;
+      const marker = sel ? '▸' : ' ';
+      const model = state.positions[p.key]?.model || cfg.positions[p.key]?.name || '-';
+      moveCursor(px + 3, ry);
+      if (sel) {
+        process.stdout.write(`${c.accent}${marker} ${p.key.padEnd(10)}${c.text}${model}${c.reset}`);
+      } else {
+        process.stdout.write(`${c.faint}${marker} ${p.key.padEnd(10)}${c.sub}${model}${c.reset}`);
+      }
+      ry++;
+    }
   });
 
-  ry++;
-  // 可用模型列表
-  moveCursor(px + 3, ry);
-  process.stdout.write(`${c.sub}可用模型 (${cfg.models.length}) — a 添加新模型:${c.reset}`);
-  ry++;
-  if (cfg.models.length === 0) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.yellow}(暂无模型 — 按 a 添加你的第一个模型)${c.reset}`);
-  } else {
-    const names = cfg.models.map(m => m.name).join(' · ');
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.faint}${truncateAnsi(names, pw - 8)}${c.reset}`);
-  }
-  ry += 2;
+  ry += 1; // 空行
 
-  // ---------- 添加模型五步流程 ----------
-  if (adding) {
-    const d = state.addDraft;
-    const steps = [
-      ['1', '供应商名称', d.provider, state.addStep === 'provider'],
-      ['2', 'Base URL', d.baseUrl, state.addStep === 'baseUrl'],
-      ['3', 'API Key', d.apiKey ? '••••••••' : '(未设置)', state.addStep === 'apiKey'],
-      ['4', '模型 ID', d.modelId, state.addStep === 'modelId'],
-      ['5', '显示名称', d.displayName, state.addStep === 'displayName']
-    ];
+  // 可用模型列表 (row ~9-10)
+  if (visibleStart <= 9) {
     moveCursor(px + 3, ry);
-    process.stdout.write(`${c.sub}── 添加模型 ${'─'.repeat(pw - 16)}${c.reset}`);
+    process.stdout.write(`${c.sub}可用模型 (${cfg.models.length}) — a 添加新模型:${c.reset}`);
     ry++;
-    steps.forEach(([num, label, value, isCurrent]) => {
+    if (cfg.models.length === 0) {
       moveCursor(px + 3, ry);
-      const done = value && !isCurrent ? `${c.green}✓${c.reset}` : (isCurrent ? `${c.accent}▸${c.reset}` : `${c.faint}○${c.reset}`);
-      const valColor = isCurrent ? c.accent : c.sub;
-      const display = isCurrent ? `${value || ''}█` : (value || '—');
-      process.stdout.write(`${done} ${c.faint}${num}.${c.reset} ${c.text}${label.padEnd(6)}${c.reset} ${valColor}${truncateAnsi(display, pw - 20)}${c.reset}`);
-      ry++;
-    });
-
-    if (state.addStep === 'afterAdd') {
-      moveCursor(px + 3, ry);
-      process.stdout.write(`${c.green}✓ 已添加: ${c.text}${d.displayName}${c.reset} ${c.faint}(${d.provider} / ${d.modelId})${c.reset}`);
-      ry++;
-      moveCursor(px + 3, ry);
-      process.stdout.write(`${c.yellow}回车${c.reset}=继续同一供应商  ${c.yellow}空格${c.reset}=其他供应商  ${c.yellow}s${c.reset}=完成添加`);
+      process.stdout.write(`${c.yellow}(暂无模型 — 按 a 添加你的第一个模型)${c.reset}`);
     } else {
+      const names = cfg.models.map(m => m.name).join(' · ');
       moveCursor(px + 3, ry);
-      process.stdout.write(`${c.faint}Esc 取消添加${c.reset}`);
+      process.stdout.write(`${c.faint}${truncateAnsi(names, pw - 8)}${c.reset}`);
     }
+    ry += 2; // 空行
+  }
+
+  // 快捷键帮助 (rows ~12-17)
+  if (visibleStart <= 12) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.sub}快捷键 ${'─'.repeat(pw - 12)}${c.reset}`);
     ry++;
+    const shortcuts = [
+      ['Ctrl+T', '新建会话'],
+      ['Ctrl+W', '关闭当前会话'],
+      ['Ctrl+1-9', '切换到第 X 个会话'],
+      ['Ctrl+N', '快速新建会话 (备用)'],
+      ['Esc', '取消操作 / 清空输入'],
+      ['Tab', '切换岗位'],
+      ['Ctrl+P', '命令面板 (/)'],
+      ['Ctrl+O', '打开设置'],
+      ['/help', '显示帮助']
+    ];
+    let shown = 0;
+    shortcuts.forEach(([k, desc]) => {
+      if (visibleStart <= 12 + shown) {
+        const line = `${c.faint}${k.padEnd(12)}${c.text}${desc}${c.reset}`;
+        const displayW = displayWidth(line.replace(/\x1b\[[0-9;]*m/g, ''));
+        const remaining = Math.max(0, pw - 8 - displayW);
+        moveCursor(px + 3, ry);
+        process.stdout.write(`${line}${c.faint}${' '.repeat(remaining)}${c.reset}`);
+        ry++;
+      }
+      shown++;
+    });
+    ry += 2; // 空行
+  }
+
+  // 添加模型五步流程 (在设置面板展开时显示)
+  if (adding && state.addStep) {
+    if (visibleStart <= 18) { // 大致行号
+      moveCursor(px + 3, ry);
+      process.stdout.write(`${c.sub}── 添加模型 ${'─'.repeat(pw - 16)}${c.reset}`);
+      ry++;
+      const d = state.addDraft;
+      const steps = [
+        ['1', '供应商名称', d.provider, state.addStep === 'provider'],
+        ['2', 'Base URL', d.baseUrl, state.addStep === 'baseUrl'],
+        ['3', 'API Key', d.apiKey ? '••••••••' : '(未设置)', state.addStep === 'apiKey'],
+        ['4', '模型 ID', d.modelId, state.addStep === 'modelId'],
+        ['5', '显示名称', d.displayName, state.addStep === 'displayName']
+      ];
+      steps.forEach(([num, label, value, isCurrent]) => {
+        if (visibleStart <= 18 + steps.indexOf([num, label, value, isCurrent])) {
+          moveCursor(px + 3, ry);
+          const done = value && !isCurrent ? `${c.green}✓${c.reset}` : (isCurrent ? `${c.accent}▸${c.reset}` : `${c.faint}○${c.reset}`);
+          const valColor = isCurrent ? c.accent : c.sub;
+          const display = isCurrent ? `${value || ''}█` : (value || '—');
+          process.stdout.write(`${done} ${c.faint}${num}.${c.reset} ${c.text}${label.padEnd(6)}${c.reset} ${valColor}${truncateAnsi(display, pw - 20)}${c.reset}`);
+          ry++;
+        }
+      });
+
+      if (state.addStep === 'afterAdd') {
+        if (visibleStart <= 22) {
+          moveCursor(px + 3, ry);
+          process.stdout.write(`${c.green}✓ 已添加: ${c.text}${d.displayName}${c.reset} ${c.faint}(${d.provider} / ${d.modelId})${c.reset}`);
+          ry++;
+          moveCursor(px + 3, ry);
+          process.stdout.write(`${c.yellow}回车${c.reset}=继续同一供应商  ${c.yellow}空格${c.reset}=其他供应商  ${c.yellow}s${c.reset}=完成添加`);
+        }
+      } else {
+        if (visibleStart <= 22) {
+          moveCursor(px + 3, ry);
+          process.stdout.write(`${c.faint}Esc 取消添加${c.reset}`);
+        }
+      }
+      ry++;
+    }
   }
 
   // 底部操作提示
@@ -1456,8 +1856,15 @@ function startPathMode() {
   render();
 }
 
-function archiveSession() {
+async function archiveSession() {
   const ws = state.workspaceDir || homePath;
+  // 权限检查: 写入工作区内直接放行; 工作区外需申请
+  const ok = await checkPathPermission(ws, 'write', '存档会话记录到工作目录');
+  if (!ok) {
+    state.log('✗ 存档取消 — 未获得写入权限', c.red);
+    render();
+    return;
+  }
   try {
     if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
   } catch (e) { /* 忽略 */ }
@@ -1583,6 +1990,9 @@ async function executeGuideCommand(cmd) {
     case '/archive':
     case '/save':
       archiveSession();
+      break;
+    case '/perm':
+      showPermissionList();
       break;
     case '/agents':
       state.selectedIndex = (state.selectedIndex + 1) % POSITIONS.length;
@@ -1749,6 +2159,15 @@ function handleMouseHover(col, row) {
 
 // ---------- 鼠标点击处理 ----------
 function handleMouseClick(col, row) {
+  // 权限申请面板打开时: 点击面板外 = 拒绝, 面板内忽略 (需按键选择)
+  if (state.permissionRequest) {
+    const g = state._permGeom;
+    if (g && !(col >= g.px && col <= g.px + g.pw && row >= g.py && row <= g.py + g.ph)) {
+      resolvePermissionRequest('N');
+    }
+    return;
+  }
+
   const W = state.terminalWidth;
   const H = state.terminalHeight;
   const treeW = Math.max(30, Math.floor(W * 0.34));
@@ -1822,6 +2241,21 @@ function handleMouseClick(col, row) {
     return;
   }
 
+  // 输入框点击: 设置光标位置
+  if (!state.running && !state.questionnaire && !state.modelsOpen && !state.addStep && !state.pathMode) {
+    const inputY = H - 3;
+    // 输入框位于第二列 (提示符 '> ' 在第二列), 输入从第 4 列开始 (2 + 2)
+    // 计算点击位置在哪个字符处
+    const promptLen = 3; // '> ' 占 2 个字符, 但 border 后至少移到第 2 列? 实际在 render 中 write(2, inputY, ...)
+    if (row === inputY && col >= 2) {
+      // 2 + prompt.length + cursorPosition => cursorX = col
+      state.cursorPosition = col - 2 - promptLen;
+      if (state.cursorPosition < 0) state.cursorPosition = 0;
+      if (state.cursorPosition > state.currentInput.length) state.cursorPosition = state.currentInput.length;
+      render();
+    }
+  }
+
   // 指令面板激活时: 点击命令项执行
   if (state.guideActive) {
     const filtered = state.filteredCommands();
@@ -1863,6 +2297,21 @@ function handleSettingsKey(str, key) {
   if (key.name === 'escape') {
     persistSettings();
     state.settingsOpen = false;
+    render();
+    return true;
+  }
+
+  // 设置面板滚动: 上下箭头
+  if (key.name === 'up') {
+    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 22 : 15) : 0) - (state.terminalHeight - 20));
+    state.settingsScroll = Math.max(0, state.settingsScroll - 1);
+    if (state.settingsScroll > max) state.settingsScroll = max;
+    render();
+    return true;
+  }
+  if (key.name === 'down') {
+    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 22 : 15) : 0) - (state.terminalHeight - 20));
+    state.settingsScroll = Math.min(max, state.settingsScroll + 1);
     render();
     return true;
   }
@@ -1977,8 +2426,33 @@ function parseInput() {
           handleMouseHover(col, row);            // 无按键移动 = 悬停跟踪
         } else if (btn < 32 && mouse[4] === 'M') {
           handleMouseClick(col, row);            // 左/中/右键按下 = 点击
+        } else if (btn >= 64 && btn <= 67 && mouse[4] === 'M') {
+          // 滚轮事件: 64=up, 65=down, 66=left, 67=right
+          // 只有当鼠标在设置面板内时才触发滚动
+          if (state.settingsOpen && !state.addStep) {
+            const pw = 52, ph = 17;
+            const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
+            const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
+            if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
+              const delta = btn === 64 || btn === 66 ? -1 : 1;
+              const max = Math.max(0, 15 - (state.terminalHeight - 20));
+              state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
+              render();
+            }
+          } else if (state.settingsOpen && state.addStep) {
+            // 添加模型流程中也允许滚动
+            const pw = 52, ph = 24;
+            const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
+            const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
+            if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
+              const delta = btn === 64 || btn === 66 ? -1 : 1;
+              const max = Math.max(0, 22 - (state.terminalHeight - 20));
+              state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
+              render();
+            }
+          }
         }
-        // 64/65 滚轮、32-34 拖拽、m 释放: 忽略
+        // 32-34 拖拽、m 释放: 忽略
       }
       inputBuffer = inputBuffer.slice(mouse[0].length);
       continue;
@@ -2045,6 +2519,12 @@ async function handleKey(str, key) {
       process.exit(0);
     }
     return;   // 其它按键忽略, 直到初始化完成
+  }
+
+  // ---- 权限申请面板 (最高优先级, 弹出时拦截所有其它输入) ----
+  if (state.permissionRequest) {
+    handlePermissionKey(str, key);
+    return;
   }
 
   // ---- 智能体问卷 (最高优先级, 弹出时拦截所有其它输入) ----
@@ -2202,7 +2682,7 @@ async function handleKey(str, key) {
   // ---- 多会话快捷键 (仅空闲时) ----
   if (!state.running && !state.questionnaire && !state.modelsOpen && !state.addStep
       && !state.subSession && !state.pathMode && !state.needsInit) {
-    if (key.ctrl && key.name === 't') { newSession(); return; }
+    if (key.ctrl && (key.name === 't' || key.name === 'n')) { newSession(); return; }
     if (key.ctrl && key.name === 'w') { closeSession(state.activeIndex); return; }
     if (key.ctrl && /^[1-9]$/.test(key.name)) {
       switchSession(parseInt(key.name, 10) - 1);
@@ -2323,10 +2803,36 @@ async function handleKey(str, key) {
 
   // ---- 退格 ----
   if (key.name === 'backspace') {
-    state.currentInput = state.currentInput.slice(0, -1);
+    if (state.cursorPosition > 0) {
+      state.currentInput = state.currentInput.slice(0, state.cursorPosition - 1) +
+                           state.currentInput.slice(state.cursorPosition);
+      state.cursorPosition--;
+      if (state.cursorPosition >= state.currentInput.length) {
+        state.cursorPosition = state.currentInput.length;
+      }
+    }
     state.guideIndex = 0;
     render();
     return;
+  }
+
+  // ---- 方向键移动光标（左右） ----
+  if (!state.running && !state.guideActive && !state.modelsOpen && !state.questionnaire
+      && !state.addStep && !state.subSession && !state.pathMode && !state.needsInit) {
+    if (key.name === 'left') {
+      if (state.cursorPosition > 0) {
+        state.cursorPosition--;
+        render();
+      }
+      return;
+    }
+    if (key.name === 'right') {
+      if (state.cursorPosition < state.currentInput.length) {
+        state.cursorPosition++;
+        render();
+      }
+      return;
+    }
   }
 
   // ---- 普通字符 ----
@@ -2376,4 +2882,22 @@ async function startTUI() {
   process.stdin.resume();
 }
 
-module.exports = { startTUI, getState: () => state };
+module.exports = {
+  startTUI,
+  getState: () => state,
+  // 测试钩子 (仅供自动化测试, 正常使用不受影响)
+  __test: {
+    initState: () => { if (!state) state = new TUIState(); return state; },
+    checkPathPermission,
+    getPermission,
+    isInsideWorkspace,
+    normalizePath,
+    requestPermission,
+    resolvePermissionRequest,
+    handlePermissionKey,
+    grantPermission,
+    showPermissionList,
+    handleKey: (str, key) => handleKey(str, key),
+    handleKeyPublic: (str, key) => handleKey(str, key)
+  }
+};
