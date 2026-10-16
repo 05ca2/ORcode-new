@@ -37,7 +37,7 @@ const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
 
   // ==================== 1. 像素 logo 双色 ====================
   const GRAY = '\x1b[38;5;245m';
-  const BLUE = '\x1b[38;5;17m';
+  const BLUE = '\x1b[38;2;5;5;26m';
   const logo = T.renderPixelLogo();
   check('logo 5 行', logo.length === 5);
   check('每行同时含灰色段与蓝黑段', logo.every(l => l.includes(GRAY) && l.includes(BLUE)));
