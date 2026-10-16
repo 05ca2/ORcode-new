@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.7',
+  version: '0.2.8',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -26,6 +26,8 @@ const defaultConfig = {
   defaultWorkspaceDir: null,   // 初始化时填写的默认工作区 (新会话继承此值)
   initialized: false,          // 是否已初始化 (orcode init 后变为 true)
   pathPermissions: {},         // 持久化的路径授权: { 绝对路径: 'full' | 'read' | 'denied' }
+  maxFileReadSize: 10 * 1024 * 1024,  // 模型读取文件的字节上限 (默认 10MB)
+  maxFileReadChars: 20000,            // 单次回传给模型的字符上限 (默认 20000)
   apiKeys: {}
 };
 
@@ -41,6 +43,8 @@ function loadConfig() {
     if (!cfg.positions) cfg.positions = {};
     if (!cfg.apiKeys) cfg.apiKeys = {};
     if (!cfg.pathPermissions) cfg.pathPermissions = {};
+    if (typeof cfg.maxFileReadSize !== 'number' || cfg.maxFileReadSize <= 0) cfg.maxFileReadSize = defaultConfig.maxFileReadSize;
+    if (typeof cfg.maxFileReadChars !== 'number' || cfg.maxFileReadChars <= 0) cfg.maxFileReadChars = defaultConfig.maxFileReadChars;
     if (!cfg.defaultWorkspaceDir) cfg.defaultWorkspaceDir = cfg.workspaceDir || null;
     if (typeof cfg.initialized !== 'boolean') cfg.initialized = false;
     if (!cfg.defaultModel) {
@@ -137,6 +141,7 @@ const GUIDE_COMMANDS = [
   ['/close', 'Close current session tab'],
   ['/archive', 'Save current session transcript to file'],
   ['/perm', 'View and manage path permissions'],
+  ['/readlimit', 'View or set file read limits (MB)'],
   ['/remember', 'Save a fact to long-term memory'],
   ['/memory', 'List saved memories'],
   ['/forget', 'Delete memories by id or keyword'],
@@ -720,8 +725,18 @@ function extractMemories(text) {
 
 // ============ 模型文件工具 (读取/列目录, 权限实时生效) ============
 // 模型通过回复中的工具块请求文件访问, TUI 执行并经权限系统把关:
-//   <<<READ {"path":"...", "reason":"..."} READ>>>   读取文件 (最多 4000 字符)
+//   <<<READ {"path":"...", "reason":"..."} READ>>>   读取文件 (大小/字符上限可配置)
 //   <<<LIST {"path":"...", "reason":"..."} LIST>>>   列出目录 (最多 100 项)
+
+// 文件读取上限 (可在设置面板调整, 持久化到 config)
+function getMaxReadSize() {
+  const v = state.config.maxFileReadSize;
+  return (typeof v === 'number' && v > 0) ? v : 10 * 1024 * 1024;   // 默认 10MB
+}
+function getMaxReadChars() {
+  const v = state.config.maxFileReadChars;
+  return (typeof v === 'number' && v > 0) ? v : 20000;               // 默认 20000 字符
+}
 
 // 解析模型给的路径: 相对路径基于当前工作区, ~ 基于 HOME
 function resolveModelPath(p) {
@@ -782,15 +797,16 @@ async function executeFileOps(ops) {
           results.push({ op, ok: false, error: '这是目录 — 请改用 LIST 列目录', resolved: p });
           continue;
         }
-        if (stat.size > 1024 * 1024) {
-          results.push({ op, ok: false, error: `文件过大 (${(stat.size / 1048576).toFixed(1)}MB > 1MB 上限)`, resolved: p });
+        if (stat.size > getMaxReadSize()) {
+          results.push({ op, ok: false, error: `文件过大 (${(stat.size / 1048576).toFixed(1)}MB > ${(getMaxReadSize() / 1048576).toFixed(0)}MB 上限, 可在设置中调整)`, resolved: p });
           continue;
         }
         let content = fs.readFileSync(p, 'utf-8');
-        const truncated = content.length > 4000;
-        if (truncated) content = content.slice(0, 4000);
+        const maxChars = getMaxReadChars();
+        const truncated = content.length > maxChars;
+        if (truncated) content = content.slice(0, maxChars);
         results.push({ op, ok: true, content, truncated, resolved: p });
-        state.log(`📖 已读取文件: ${p} (${stat.size} 字节${truncated ? ', 截断至 4000 字符' : ''})`, c.cyan);
+        state.log(`📖 已读取文件: ${p} (${stat.size} 字节${truncated ? `, 截断至 ${maxChars} 字符` : ''})`, c.cyan);
       }
     } catch (e) {
       results.push({ op, ok: false, error: e.message, resolved: p });
@@ -1764,12 +1780,12 @@ function renderSettingsPanel() {
   const cfg = state.config;
   const pw = 52;
   const adding = !!state.addStep;
-  const ph = adding ? 24 : 17;
+  const ph = adding ? 26 : 19;
   const px = Math.max(4, Math.floor((W - Math.max(30, Math.floor(W * 0.34))) * 0.5) - Math.floor(pw / 2));
   const py = Math.max(1, Math.floor((H - ph) / 2));
 
   // 计算可滚动区域
-  const contentRows = adding ? 22 : 15; // 内容总行数的近似值 (不含标题/边框)
+  const contentRows = adding ? 24 : 17; // 内容总行数的近似值 (不含标题/边框)
   const maxScroll = Math.max(0, contentRows - (ph - 5)); // 减去标题和底部提示的高度
   state.settingsScroll = Math.min(maxScroll, Math.max(0, state.settingsScroll));
 
@@ -1833,14 +1849,30 @@ function renderSettingsPanel() {
     process.stdout.write(`${c.faint}< ${c.accent}${cfg.verifyRounds}${c.faint} >${c.reset}`);
     ry++;
   }
-  // 提示 (row 2) - 仅在非添加模式
+  // 读取文件大小上限 (row 2) — < > (或 , .) 调整, 单位 MB
   if (!adding && visibleStart <= 2) {
     moveCursor(px + 3, ry);
-    process.stdout.write(`${c.faint}(提示：-/+ 改Workers, [] 改轮数, d 改初始模型, a 添加模型)${c.reset}`);
+    process.stdout.write(`${c.text}读取文件大小上限 < >${c.reset}`);
+    moveCursor(px + pw - 16, ry);
+    process.stdout.write(`${c.faint}< ${c.accent}${(getMaxReadSize() / 1048576).toFixed(0)}MB${c.faint} >${c.reset}`);
     ry++;
   }
-  // 初始模型 (row 3)
-  if (visibleStart <= 3) {
+  // 读取字符上限 (row 3) — ; ' 调整
+  if (!adding && visibleStart <= 3) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.text}单次读取字符上限 ; '${c.reset}`);
+    moveCursor(px + pw - 16, ry);
+    process.stdout.write(`${c.faint}< ${c.accent}${(getMaxReadChars() / 1000).toFixed(0)}k${c.faint} >${c.reset}`);
+    ry++;
+  }
+  // 提示 (row 4) - 仅在非添加模式
+  if (!adding && visibleStart <= 4) {
+    moveCursor(px + 3, ry);
+    process.stdout.write(`${c.faint}(提示：-/+ 改Workers, [] 改轮数, <> 改文件大小)${c.reset}`);
+    ry++;
+  }
+  // 初始模型 (row 5)
+  if (visibleStart <= 5) {
     moveCursor(px + 3, ry);
     process.stdout.write(`${c.text}初始模型 (d 更换)${c.reset}`);
     moveCursor(px + pw - 20, ry);
@@ -1849,15 +1881,15 @@ function renderSettingsPanel() {
   }
   ry += 1; // 空行
 
-  // 岗位模型标题 (row 5)
-  if (visibleStart <= 5) {
+  // 岗位模型标题 (row 7)
+  if (visibleStart <= 7) {
     moveCursor(px + 3, ry);
     process.stdout.write(`${c.sub}岗位模型 (tab 切换 · m 更换模型)${c.reset}`);
     ry++;
   }
-  // 岗位列表 (rows 6-9) - 跳过 4 个岗位
+  // 岗位列表 (rows 8-11) - 跳过 4 个岗位
   POSITIONS.forEach((p, idx) => {
-    if (visibleStart <= 6 + idx && visibleStart > 5 + idx) {
+    if (visibleStart <= 8 + idx && visibleStart > 7 + idx) {
       const sel = state.settingsPos === idx;
       const marker = sel ? '▸' : ' ';
       const model = state.positions[p.key]?.model || cfg.positions[p.key]?.name || '-';
@@ -1873,8 +1905,8 @@ function renderSettingsPanel() {
 
   ry += 1; // 空行
 
-  // 可用模型列表 (row ~9-10)
-  if (visibleStart <= 9) {
+  // 可用模型列表 (row ~11)
+  if (visibleStart <= 11) {
     moveCursor(px + 3, ry);
     process.stdout.write(`${c.sub}可用模型 (${cfg.models.length}) — a 添加新模型:${c.reset}`);
     ry++;
@@ -1889,8 +1921,8 @@ function renderSettingsPanel() {
     ry += 2; // 空行
   }
 
-  // 快捷键帮助 (rows ~12-17)
-  if (visibleStart <= 12) {
+  // 快捷键帮助 (rows ~14+)
+  if (visibleStart <= 14) {
     moveCursor(px + 3, ry);
     process.stdout.write(`${c.sub}快捷键 ${'─'.repeat(pw - 12)}${c.reset}`);
     ry++;
@@ -1903,11 +1935,13 @@ function renderSettingsPanel() {
       ['Tab', '切换岗位'],
       ['Ctrl+P', '命令面板 (/)'],
       ['Ctrl+O', '打开设置'],
+      ['PgUp/PgDn', '翻看对话历史'],
+      ['/perm', '查看路径权限'],
       ['/help', '显示帮助']
     ];
     let shown = 0;
     shortcuts.forEach(([k, desc]) => {
-      if (visibleStart <= 12 + shown) {
+      if (visibleStart <= 14 + shown) {
         const line = `${c.faint}${k.padEnd(12)}${c.text}${desc}${c.reset}`;
         const displayW = displayWidth(line.replace(/\x1b\[[0-9;]*m/g, ''));
         const remaining = Math.max(0, pw - 8 - displayW);
@@ -1922,7 +1956,7 @@ function renderSettingsPanel() {
 
   // 添加模型五步流程 (在设置面板展开时显示)
   if (adding && state.addStep) {
-    if (visibleStart <= 18) { // 大致行号
+    if (visibleStart <= 20) { // 大致行号
       moveCursor(px + 3, ry);
       process.stdout.write(`${c.sub}── 添加模型 ${'─'.repeat(pw - 16)}${c.reset}`);
       ry++;
@@ -1934,8 +1968,8 @@ function renderSettingsPanel() {
         ['4', '模型 ID', d.modelId, state.addStep === 'modelId'],
         ['5', '显示名称', d.displayName, state.addStep === 'displayName']
       ];
-      steps.forEach(([num, label, value, isCurrent]) => {
-        if (visibleStart <= 18 + steps.indexOf([num, label, value, isCurrent])) {
+      steps.forEach(([num, label, value, isCurrent], si) => {
+        if (visibleStart <= 20 + si) {
           moveCursor(px + 3, ry);
           const done = value && !isCurrent ? `${c.green}✓${c.reset}` : (isCurrent ? `${c.accent}▸${c.reset}` : `${c.faint}○${c.reset}`);
           const valColor = isCurrent ? c.accent : c.sub;
@@ -1946,7 +1980,7 @@ function renderSettingsPanel() {
       });
 
       if (state.addStep === 'afterAdd') {
-        if (visibleStart <= 22) {
+        if (visibleStart <= 24) {
           moveCursor(px + 3, ry);
           process.stdout.write(`${c.green}✓ 已添加: ${c.text}${d.displayName}${c.reset} ${c.faint}(${d.provider} / ${d.modelId})${c.reset}`);
           ry++;
@@ -1954,7 +1988,7 @@ function renderSettingsPanel() {
           process.stdout.write(`${c.yellow}回车${c.reset}=继续同一供应商  ${c.yellow}空格${c.reset}=其他供应商  ${c.yellow}s${c.reset}=完成添加`);
         }
       } else {
-        if (visibleStart <= 22) {
+        if (visibleStart <= 24) {
           moveCursor(px + 3, ry);
           process.stdout.write(`${c.faint}Esc 取消添加${c.reset}`);
         }
@@ -1968,7 +2002,7 @@ function renderSettingsPanel() {
   if (adding) {
     process.stdout.write(`${c.faint}每步输入后按回车确认${c.reset}`);
   } else {
-    process.stdout.write(`${c.faint}-/+ 数量 · [ ] 轮数 · d 初始模型 · a 添加模型 · Esc 保存${c.reset}`);
+    process.stdout.write(`${c.faint}-/+ 数量 · [] 轮数 · <> 文件大小 · ;' 字符数 · Esc 保存${c.reset}`);
   }
 }
 
@@ -2319,6 +2353,28 @@ async function executeGuideCommand(cmd) {
     case '/perm':
       showPermissionList();
       break;
+    case '/readlimit': {
+      const arg = parts.slice(1).join(' ').trim();
+      const curMB = (getMaxReadSize() / 1048576).toFixed(0);
+      const curK = (getMaxReadChars() / 1000).toFixed(0);
+      if (!arg) {
+        state.log(`📏 当前读取上限: 文件大小 ${curMB}MB · 单次字符 ${curK}k`);
+        state.log('  用法: /readlimit <MB> (1-100) 调整文件大小上限; 设置面板中 ; \' 调字符数');
+        render();
+        break;
+      }
+      const mb = parseInt(arg, 10);
+      if (!Number.isFinite(mb) || mb < 1 || mb > 100) {
+        state.log('◍ 请输入 1-100 之间的数字 (MB)');
+        render();
+        break;
+      }
+      state.config.maxFileReadSize = mb * 1048576;
+      saveConfig(state.config);
+      state.log(`✓ 读取文件大小上限已设为: ${mb}MB`, c.green);
+      render();
+      break;
+    }
     case '/remember': {
       const fact = parts.slice(1).join(' ').trim();
       if (!fact) {
@@ -2670,14 +2726,14 @@ function handleSettingsKey(str, key) {
 
   // 设置面板滚动: 上下箭头
   if (key.name === 'up') {
-    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 22 : 15) : 0) - (state.terminalHeight - 20));
+    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 24 : 17) : 0) - (state.terminalHeight - 20));
     state.settingsScroll = Math.max(0, state.settingsScroll - 1);
     if (state.settingsScroll > max) state.settingsScroll = max;
     render();
     return true;
   }
   if (key.name === 'down') {
-    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 22 : 15) : 0) - (state.terminalHeight - 20));
+    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 24 : 17) : 0) - (state.terminalHeight - 20));
     state.settingsScroll = Math.min(max, state.settingsScroll + 1);
     render();
     return true;
@@ -2722,6 +2778,35 @@ function handleSettingsKey(str, key) {
   }
   if (str === ']' || str === '}') {
     cfg.verifyRounds = Math.min(5, cfg.verifyRounds + 1);
+    render(); return true;
+  }
+
+  // 读取文件大小上限 (MB): < > 调整, 范围 1-100MB
+  if (str === '<' || str === ',') {
+    const mb = Math.max(1, Math.round(getMaxReadSize() / 1048576) - 1);
+    cfg.maxFileReadSize = mb * 1048576;
+    state.log(`▸ 读取文件大小上限: ${mb}MB`);
+    saveConfig(cfg);
+    render(); return true;
+  }
+  if (str === '>' || str === '.') {
+    const mb = Math.min(100, Math.round(getMaxReadSize() / 1048576) + 1);
+    cfg.maxFileReadSize = mb * 1048576;
+    state.log(`▸ 读取文件大小上限: ${mb}MB`);
+    saveConfig(cfg);
+    render(); return true;
+  }
+  // 单次读取字符上限: ; ' 调整 (2000 步进, 范围 2k-200k)
+  if (str === ';') {
+    cfg.maxFileReadChars = Math.max(2000, getMaxReadChars() - 2000);
+    state.log(`▸ 单次读取字符上限: ${cfg.maxFileReadChars}`);
+    saveConfig(cfg);
+    render(); return true;
+  }
+  if (str === "'") {
+    cfg.maxFileReadChars = Math.min(200000, getMaxReadChars() + 2000);
+    state.log(`▸ 单次读取字符上限: ${cfg.maxFileReadChars}`);
+    saveConfig(cfg);
     render(); return true;
   }
 
@@ -2798,23 +2883,23 @@ function parseInput() {
           const wheelUp = btn === 64 || btn === 66;
           // ① 设置面板内 → 设置面板滚动 (最高优先, 面板是覆盖层)
           if (state.settingsOpen && !state.addStep) {
-            const pw = 52, ph = 17;
+            const pw = 52, ph = 19;
             const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
             const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
             if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
               const delta = wheelUp ? -1 : 1;
-              const max = Math.max(0, 15 - (state.terminalHeight - 20));
+              const max = Math.max(0, 17 - (state.terminalHeight - 20));
               state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
               render();
             }
           } else if (state.settingsOpen && state.addStep) {
             // 添加模型流程中也允许滚动
-            const pw = 52, ph = 24;
+            const pw = 52, ph = 26;
             const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
             const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
             if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
               const delta = wheelUp ? -1 : 1;
-              const max = Math.max(0, 22 - (state.terminalHeight - 20));
+              const max = Math.max(0, 24 - (state.terminalHeight - 20));
               state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
               render();
             }
@@ -3318,6 +3403,8 @@ module.exports = {
     resolveModelPath,
     extractFileOps,
     executeFileOps,
+    getMaxReadSize,
+    getMaxReadChars,
     handleKey: (str, key) => handleKey(str, key),
     handleKeyPublic: (str, key) => handleKey(str, key)
   }

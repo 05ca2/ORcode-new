@@ -23,7 +23,9 @@ fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify({
 
 // 测试文件
 fs.writeFileSync(path.join(workspace, 'notes.txt'), '第一行\n第二行\n第三行', 'utf-8');
-fs.writeFileSync(path.join(workspace, 'big.txt'), 'x'.repeat(5000), 'utf-8');
+fs.writeFileSync(path.join(workspace, 'big.txt'), 'x'.repeat(5000), 'utf-8');       // 5000 字符 (小于默认 20000, 不截断)
+fs.writeFileSync(path.join(workspace, 'huge.txt'), 'y'.repeat(25000), 'utf-8');     // 25000 字符 (超默认, 截断)
+fs.writeFileSync(path.join(workspace, 'mid.bin'), 'z'.repeat(2 * 1024 * 1024), 'utf-8'); // 2MB (超旧 1MB 限, 低于新 10MB 限)
 fs.mkdirSync(path.join(workspace, 'sub'), { recursive: true });
 fs.writeFileSync(path.join(workspace, 'sub', 'a.md'), '# 标题', 'utf-8');
 fs.writeFileSync(path.join(outside, 'secret.txt'), '机密内容', 'utf-8');
@@ -83,7 +85,37 @@ const K = (name, extra = {}) => Object.assign({ name, ctrl: false, meta: false }
   check('读不存在文件报错', !res4[0].ok && res4[0].error.length > 0);
 
   const res5 = await tui.__test.executeFileOps([{ type: 'read', path: 'big.txt', reason: '测试' }]);
-  check('大文件截断到 4000 字符', res5[0].ok && res5[0].content.length === 4000 && res5[0].truncated === true);
+  check('5000 字符文件完整读取 (默认 20000 上限)', res5[0].ok && res5[0].content.length === 5000 && res5[0].truncated === false);
+
+  const res5b = await tui.__test.executeFileOps([{ type: 'read', path: 'huge.txt', reason: '测试' }]);
+  check('25000 字符文件截断到 20000', res5b[0].ok && res5b[0].content.length === 20000 && res5b[0].truncated === true);
+
+  const res5c = await tui.__test.executeFileOps([{ type: 'read', path: 'mid.bin', reason: '测试' }]);
+  check('2MB 文件可读 (上限已提高到 10MB)', res5c[0].ok);
+
+  // ==================== 3b. 上限可配置 ====================
+  check('默认大小上限 10MB', tui.__test.getMaxReadSize() === 10 * 1024 * 1024);
+  check('默认字符上限 20000', tui.__test.getMaxReadChars() === 20000);
+
+  // 调小上限 → 2MB 文件被拒
+  state.config.maxFileReadSize = 1 * 1024 * 1024;
+  const res5d = await tui.__test.executeFileOps([{ type: 'read', path: 'mid.bin', reason: '测试' }]);
+  check('调小上限后 2MB 文件被拒', !res5d[0].ok && res5d[0].error.includes('文件过大'));
+  state.config.maxFileReadSize = 10 * 1024 * 1024;
+
+  // 调小字符上限 → 截断到设定值
+  state.config.maxFileReadChars = 1000;
+  const res5e = await tui.__test.executeFileOps([{ type: 'read', path: 'big.txt', reason: '测试' }]);
+  check('调小字符上限后按新值截断', res5e[0].ok && res5e[0].content.length === 1000 && res5e[0].truncated === true);
+  state.config.maxFileReadChars = 20000;
+
+  // 非法配置值回退默认
+  state.config.maxFileReadSize = -5;
+  state.config.maxFileReadChars = 'abc';
+  check('非法配置回退默认 10MB', tui.__test.getMaxReadSize() === 10 * 1024 * 1024);
+  check('非法配置回退默认 20000', tui.__test.getMaxReadChars() === 20000);
+  state.config.maxFileReadSize = 10 * 1024 * 1024;
+  state.config.maxFileReadChars = 20000;
 
   // ==================== 4. executeFileOps — 工作区外需权限 ====================
   let denied = null;
