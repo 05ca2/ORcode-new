@@ -75,7 +75,7 @@ server.listen(18924, '127.0.0.1', async () => {
     await new Promise(r => setTimeout(r, 1500));
 
     check('共发生 2 次模型调用 (读文件→作答)', callCount === 2);
-    check('第一轮 prompt 教了文件工具协议', prompts[0] && prompts[0].includes('[文件工具]') && prompts[0].includes('READ'));
+    check('第一轮 prompt 教了文件工具协议', prompts[0] && prompts[0].includes('[工具]') && prompts[0].includes('READ') && prompts[0].includes('SEARCH'));
     check('第二轮 prompt 含文件结果回传', prompts[1] && prompts[1].includes('[文件结果·文件内容]') && prompts[1].includes('Unit 6: Changing Population'));
     check('文件结果指向工作区内真实路径', prompts[1] && prompts[1].includes(path.join(workspace, 'geography.txt')));
 

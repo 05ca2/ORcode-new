@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.10',
+  version: '0.2.11',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -140,6 +140,8 @@ const GUIDE_COMMANDS = [
   ['/new', 'Open a new session tab'],
   ['/close', 'Close current session tab'],
   ['/archive', 'Save current session transcript to file'],
+  ['/archives', 'List saved session archives'],
+  ['/search', 'Web search (DuckDuckGo)'],
   ['/perm', 'View and manage path permissions'],
   ['/readlimit', 'View or set file read limits (MB)'],
   ['/remember', 'Save a fact to long-term memory'],
@@ -242,8 +244,15 @@ class TUIState {
 
   log(text, color) {
     // color 可选: 显式指定渲染颜色 (否则按关键词自动着色)
-    this.history.push(color ? { text, color } : text);
-    if (this.history.length > 200) this.history.shift();
+    // 自适应换行: 按左侧历史面板可用宽度折行, 长行 (长路径/长答复) 不再被截断丢失
+    const W = this.terminalWidth || 100;
+    const treeW = Math.max(30, Math.floor(W * 0.34));
+    const wrapW = Math.max(20, W - treeW - 5);   // 与渲染区 mainW-4 对齐
+    const wrapped = wrapText(text, wrapW);
+    for (const ln of wrapped) {
+      this.history.push(color ? { text: ln, color } : ln);
+    }
+    if (this.history.length > 600) this.history.splice(0, this.history.length - 600);
   }
 }
 
@@ -399,6 +408,14 @@ function closeSession(idx) {
     render();
     return;
   }
+  // 自动存档: 关闭当前会话前, 若该会话有真实对话 (用户输入过), 先落盘保存记录
+  if (idx === state.activeIndex &&
+      state.history.some(h => (typeof h === 'object' ? (h.text || '') : String(h)).startsWith('▸ 你:'))) {
+    try {
+      const f = writeArchiveFile();
+      state.log(`🗄 已自动存档该会话: ${path.basename(f)}`, c.cyan);
+    } catch (e) { /* 存档失败不阻塞关闭 */ }
+  }
   // 关闭前先把当前 (若正是它) 序列化, 选好邻居
   const neighbor = (idx === state.activeIndex) ? Math.max(0, idx - 1) : state.activeIndex;
   if (idx === state.activeIndex) serializeSession(idx);
@@ -451,6 +468,43 @@ function truncateAnsi(str, maxWidth) {
     i++;
   }
   return result + c.reset;
+}
+
+// 自适应换行: 按显示宽度把一行文本折成多行 (中英文混排/宽字符安全, 保留 ANSI 色码)
+function wrapText(text, width) {
+  const s = String(text ?? '');
+  if (width < 8 || displayWidth(s) <= width) return [s];
+  const chars = Array.from(s);
+  const lines = [];
+  let cur = '';
+  let w = 0;
+  let i = 0;
+  while (i < chars.length) {
+    // ANSI 色码 (ESC [ ... m) 原样保留, 不计宽度
+    if (chars[i] === '\x1b' && chars[i + 1] === '[') {
+      let j = i + 2;
+      while (j < chars.length && /[0-9;]/.test(chars[j])) j++;
+      if (chars[j] === 'm') {
+        cur += chars.slice(i, j + 1).join('');
+        i = j + 1;
+        continue;
+      }
+    }
+    const ch = chars[i];
+    const cw = displayWidth(ch);
+    if (w + cw > width) {
+      lines.push(cur);
+      cur = '';
+      w = 0;
+      while (chars[i] === ' ') i++;   // 续行跳过行首空格
+      continue;
+    }
+    cur += ch;
+    w += cw;
+    i++;
+  }
+  if (cur || lines.length === 0) lines.push(cur);
+  return lines;
 }
 
 function write(x, y, text, color) {
@@ -767,14 +821,115 @@ function extractFileOps(text) {
       if (o && o.path) ops.push({ type: 'list', path: String(o.path), reason: String(o.reason || '') });
     } catch (e) { /* 非法 JSON 忽略 */ }
   }
-  const cleaned = s.replace(/<<<READ[\s\S]*?READ>>>/g, '').replace(/<<<LIST[\s\S]*?LIST>>>/g, '').trim();
+  const searchRe = /<<<SEARCH\s*([\s\S]*?)\s*SEARCH>>>/g;
+  while ((m = searchRe.exec(s)) !== null) {
+    try {
+      const o = JSON.parse(m[1].trim());
+      if (o && o.query) ops.push({ type: 'search', query: String(o.query), reason: String(o.reason || '') });
+    } catch (e) { /* 非法 JSON 忽略 */ }
+  }
+  const cleaned = s
+    .replace(/<<<READ[\s\S]*?READ>>>/g, '')
+    .replace(/<<<LIST[\s\S]*?LIST>>>/g, '')
+    .replace(/<<<SEARCH[\s\S]*?SEARCH>>>/g, '')
+    .trim();
   return { cleaned, ops };
+}
+
+// ============ 联网搜索 (DuckDuckGo, 无需 API Key) ============
+function decodeHtmlEntities(s) {
+  return String(s || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => {
+      const code = parseInt(n, 10);
+      try { return code > 0 ? String.fromCodePoint(code) : ''; } catch (e) { return ''; }
+    });
+}
+
+// 解析 DuckDuckGo (lite/html 端点) 搜索结果 HTML → [{title,url,snippet}]
+function parseSearchResults(html, limit = 8) {
+  const out = [];
+  const decodeDdgUrl = (u) => {
+    // DDG 常把外链包成 //duckduckgo.com/l/?uddg=<encodeURIComponent(url)>&rut=...
+    const m = String(u || '').match(/[?&]uddg=([^&]+)/);
+    if (m) { try { return decodeURIComponent(m[1]); } catch (e) { /* 原样返回 */ } }
+    return u.startsWith('//') ? 'https:' + u : u;
+  };
+  const collect = (re, arr) => {
+    let mm;
+    while ((mm = re.exec(html)) !== null) arr.push(mm);
+  };
+  // 兼容属性顺序不同的两种写法
+  const links = [];
+  collect(/<a[^>]*class=['"]result-link['"][^>]*href=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/a>/gi, links);
+  collect(/<a[^>]*href=['"]([^'"]+)['"][^>]*class=['"]result-link['"][^>]*>([\s\S]*?)<\/a>/gi, links);
+  // 去重保序 (url, title)
+  const seen = new Set();
+  const ordered = [];
+  for (const l of links) {
+    const url = decodeDdgUrl(decodeHtmlEntities(l[1]).trim());
+    const title = decodeHtmlEntities(l[2]).replace(/\s+/g, ' ').trim();
+    if (!url.startsWith('http') || !title) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    ordered.push({ url, title });
+  }
+  const snippets = [];
+  collect(/<td[^>]*class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/gi, snippets);
+  for (let i = 0; i < ordered.length && out.length < limit; i++) {
+    out.push({
+      title: ordered[i].title,
+      url: ordered[i].url,
+      snippet: snippets[i] ? decodeHtmlEntities(snippets[i][1]).replace(/\s+/g, ' ').trim() : ''
+    });
+  }
+  return out;
+}
+
+// 真实联网搜索 (Node 22 内置 fetch, 15s 超时)
+async function webSearch(query, limit = 8) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('搜索词为空');
+  const url = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(q);
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ORcode/0.2.11',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+    },
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  const results = parseSearchResults(html, limit);
+  if (results.length === 0) throw new Error('没有解析到结果 (搜索引擎可能限流, 稍后再试)');
+  return results;
 }
 
 // 执行文件操作 (权限不足时弹申请面板; 用户拒绝则返回错误回传给模型)
 async function executeFileOps(ops) {
   const results = [];
   for (const op of ops) {
+    // 联网搜索: 不走文件路径/权限, 直接请求 DuckDuckGo
+    if (op.type === 'search') {
+      state.log(`🌐 正在联网搜索: ${op.query}`, c.accent);
+      render();
+      try {
+        const sres = await webSearch(op.query, 8);
+        const content = sres.map((r, i) =>
+          `${i + 1}. ${r.title}\n   链接: ${r.url}${r.snippet ? `\n   摘要: ${r.snippet}` : ''}`
+        ).join('\n');
+        results.push({ op, ok: true, content, resolved: `web:${op.query}` });
+        state.log(`🌐 已搜索: ${op.query} (${sres.length} 条结果)`, c.cyan);
+      } catch (e) {
+        results.push({ op, ok: false, error: `搜索失败: ${e.message}` });
+        state.log(`✗ 搜索失败: ${op.query} — ${e.message}`, c.red);
+      }
+      render();
+      continue;
+    }
     const p = resolveModelPath(op.path);
     if (!p) { results.push({ op, ok: false, error: '路径为空' }); continue; }
     // 权限检查: 工作区内直接放行; 工作区外弹面板由用户决定
@@ -1684,7 +1839,7 @@ async function runModelWithQuestionnaire(role, instruction, cfg, context = '') {
     const { cleaned: noOps, ops } = extractFileOps(result);
     if (ops.length > 0) {
       result = noOps;
-      state.log(`🔧 模型请求 ${ops.length} 个文件操作`, c.accent);
+      state.log(`🔧 模型请求 ${ops.length} 个工具操作`, c.accent);
       const fileResults = await executeFileOps(ops);
       const feedback = fileResults.map(r => {
         const target = r.resolved || resolveModelPath(r.op.path);
@@ -1694,7 +1849,7 @@ async function runModelWithQuestionnaire(role, instruction, cfg, context = '') {
         }
         return `[文件结果·失败] ${target}: ${r.error}`;
       }).join('\n\n');
-      currentInstruction = `${currentInstruction}\n\n${feedback}\n请基于以上文件结果继续完成任务 (如需更多文件可继续发起 READ/LIST)。`;
+      currentInstruction = `${currentInstruction}\n\n${feedback}\n请基于以上工具结果继续完成任务 (如需更多文件或联网信息, 可继续发起 READ/LIST/SEARCH)。`;
       continue;   // 把文件结果回传给模型, 继续循环
     }
     const { cleaned, q } = extractQuestionnaire(result);
@@ -2194,19 +2349,13 @@ function startPathMode() {
   render();
 }
 
-async function archiveSession() {
+// 把当前会话历史写成 Markdown 存档文件 (同步, 返回文件路径)
+function writeArchiveFile() {
   const ws = state.workspaceDir || homePath;
-  // 权限检查: 写入工作区内直接放行; 工作区外需申请
-  const ok = await checkPathPermission(ws, 'write', '存档会话记录到工作目录');
-  if (!ok) {
-    state.log('✗ 存档取消 — 未获得写入权限', c.red);
-    render();
-    return;
+  if (!fs.existsSync(ws)) {
+    try { fs.mkdirSync(ws, { recursive: true }); } catch (e) { /* 由调用方捕获写错误 */ }
   }
-  try {
-    if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
-  } catch (e) { /* 忽略 */ }
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23);   // 含毫秒, 避免同秒存档互相覆盖
   const file = path.join(ws, `orcode-archive-${ts}.md`);
   const head = [
     '# ORcode 会话存档',
@@ -2224,11 +2373,50 @@ async function archiveSession() {
     if (typeof h === 'object' && h.text) return h.text;
     return h;
   });
+  fs.writeFileSync(file, head.concat(body).join('\n'), 'utf-8');
+  return file;
+}
+
+async function archiveSession() {
+  const ws = state.workspaceDir || homePath;
+  // 权限检查: 写入工作区内直接放行; 工作区外需申请
+  const ok = await checkPathPermission(ws, 'write', '存档会话记录到工作目录');
+  if (!ok) {
+    state.log('✗ 存档取消 — 未获得写入权限', c.red);
+    render();
+    return;
+  }
   try {
-    fs.writeFileSync(file, head.concat(body).join('\n'), 'utf-8');
+    const file = writeArchiveFile();
     state.log(`✓ 已存档到: ${file}`, c.green);
   } catch (e) {
     state.log(`✗ 存档失败: ${e.message}`, c.red);
+  }
+  render();
+}
+
+// 列出当前工作区的存档文件 (/archives)
+function listArchives() {
+  const ws = state.workspaceDir || homePath;
+  try {
+    const files = fs.readdirSync(ws)
+      .filter(f => /^orcode-archive-.*\.md$/.test(f))
+      .sort()
+      .reverse()
+      .slice(0, 10);
+    if (files.length === 0) {
+      state.log('◍ 当前工作区暂无存档 — /archive 手动存档; 关闭会话时也会自动存档');
+    } else {
+      state.log('🗄 会话存档 (最新 10 份):', c.accent);
+      files.forEach(f => {
+        try {
+          const st = fs.statSync(path.join(ws, f));
+          state.log(`  📄 ${f} (${(st.size / 1024).toFixed(1)}KB · ${st.mtime.toLocaleString('zh-CN')})`);
+        } catch (e) { state.log(`  📄 ${f}`); }
+      });
+    }
+  } catch (e) {
+    state.log(`✗ 读取存档失败: ${e.message}`, c.red);
   }
   render();
 }
@@ -2331,6 +2519,39 @@ async function executeGuideCommand(cmd) {
     case '/save':
       archiveSession();
       break;
+    case '/archives':
+      listArchives();
+      break;
+    case '/search': {
+      const query = parts.slice(1).join(' ').trim();
+      if (!query) {
+        state.log('◍ 用法: /search <搜索词>   (模型也会通过 <<<SEARCH>>> 工具自动联网)');
+        render();
+        break;
+      }
+      if (state.running) {
+        state.log('◍ 任务进行中，请稍后再搜索');
+        render();
+        break;
+      }
+      state.running = true;
+      state.log(`🌐 正在联网搜索: ${query}`, c.accent);
+      render();
+      webSearch(query, 8).then(results => {
+        state.log(`🌐 搜索结果 (${results.length} 条):`, c.accent);
+        results.forEach((r, i) => {
+          state.log(`  ${i + 1}. ${r.title}`, c.text);
+          state.log(`     ${r.url}`, c.faint);
+          if (r.snippet) state.log(`     ${r.snippet}`, c.sub);
+        });
+      }).catch(e => {
+        state.log(`✗ 搜索失败: ${e.message}`, c.red);
+      }).finally(() => {
+        state.running = false;
+        render();
+      });
+      break;
+    }
     case '/perm':
       showPermissionList();
       break;
@@ -3369,6 +3590,12 @@ module.exports = {
     addMemory,
     removeMemory,
     searchMemories,
+    wrapText,
+    parseSearchResults,
+    webSearch,
+    extractFileOps,
+    writeArchiveFile,
+    listArchives,
     extractMemories,
     resolveModelPath,
     extractFileOps,
@@ -3382,6 +3609,7 @@ module.exports = {
     handleSettingsButton: (action, arg) => handleSettingsButton(action, arg),
     handleMouseClick: (col, row) => handleMouseClick(col, row),
     cycleDefaultModel: () => cycleDefaultModel(),
-    cyclePositionModel: (idx) => cyclePositionModel(idx)
+    cyclePositionModel: (idx) => cyclePositionModel(idx),
+    closeSession: (idx) => closeSession(idx)
   }
 };
