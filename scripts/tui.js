@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.8',
+  version: '0.2.9',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -26,7 +26,7 @@ const defaultConfig = {
   defaultWorkspaceDir: null,   // 初始化时填写的默认工作区 (新会话继承此值)
   initialized: false,          // 是否已初始化 (orcode init 后变为 true)
   pathPermissions: {},         // 持久化的路径授权: { 绝对路径: 'full' | 'read' | 'denied' }
-  maxFileReadSize: 10 * 1024 * 1024,  // 模型读取文件的字节上限 (默认 10MB)
+  maxFileReadSize: 100 * 1024 * 1024,  // 模型读取文件的字节上限 (默认 100MB, 可调 1-500MB)
   maxFileReadChars: 20000,            // 单次回传给模型的字符上限 (默认 20000)
   apiKeys: {}
 };
@@ -731,7 +731,7 @@ function extractMemories(text) {
 // 文件读取上限 (可在设置面板调整, 持久化到 config)
 function getMaxReadSize() {
   const v = state.config.maxFileReadSize;
-  return (typeof v === 'number' && v > 0) ? v : 10 * 1024 * 1024;   // 默认 10MB
+  return (typeof v === 'number' && v > 0) ? v : 100 * 1024 * 1024;  // 默认 100MB
 }
 function getMaxReadChars() {
   const v = state.config.maxFileReadChars;
@@ -797,14 +797,34 @@ async function executeFileOps(ops) {
           results.push({ op, ok: false, error: '这是目录 — 请改用 LIST 列目录', resolved: p });
           continue;
         }
-        if (stat.size > getMaxReadSize()) {
-          results.push({ op, ok: false, error: `文件过大 (${(stat.size / 1048576).toFixed(1)}MB > ${(getMaxReadSize() / 1048576).toFixed(0)}MB 上限, 可在设置中调整)`, resolved: p });
+        const maxSize = getMaxReadSize();
+        if (stat.size > maxSize) {
+          results.push({ op, ok: false, error: `文件过大 (${(stat.size / 1048576).toFixed(1)}MB > ${(maxSize / 1048576).toFixed(0)}MB 上限, /readlimit 可调)`, resolved: p });
           continue;
         }
-        let content = fs.readFileSync(p, 'utf-8');
         const maxChars = getMaxReadChars();
-        const truncated = content.length > maxChars;
-        if (truncated) content = content.slice(0, maxChars);
+        // 大文件优化: 只读前 maxChars*4 字节 (UTF-8 最坏 4 字节/字符) 再解码,
+        // 避免把几百 MB 的文件整体载入内存
+        const readBytes = Math.min(stat.size, maxChars * 4 + 4);
+        const fd = fs.openSync(p, 'r');
+        let buf;
+        try {
+          buf = Buffer.alloc(readBytes);
+          fs.readSync(fd, buf, 0, readBytes, 0);
+        } finally {
+          fs.closeSync(fd);
+        }
+        // 二进制识别: 前 1024 字节含 NUL → 非文本文件 (PPT/PDF/图片等), 不喂乱码
+        if (buf.subarray(0, Math.min(1024, buf.length)).includes(0)) {
+          results.push({ op, ok: false, error: '二进制文件 (如 PPT/PDF/图片/压缩包) — 暂不支持直接读取文本内容', resolved: p });
+          state.log(`⊘ 二进制文件跳过: ${p}`, c.yellow);
+          render();
+          continue;
+        }
+        let content = buf.toString('utf-8');
+        // 去掉可能被截断的多字节字符残留 (替换码)
+        const truncated = stat.size > readBytes || content.length > maxChars;
+        if (content.length > maxChars) content = content.slice(0, maxChars);
         results.push({ op, ok: true, content, truncated, resolved: p });
         state.log(`📖 已读取文件: ${p} (${stat.size} 字节${truncated ? `, 截断至 ${maxChars} 字符` : ''})`, c.cyan);
       }
@@ -2359,13 +2379,13 @@ async function executeGuideCommand(cmd) {
       const curK = (getMaxReadChars() / 1000).toFixed(0);
       if (!arg) {
         state.log(`📏 当前读取上限: 文件大小 ${curMB}MB · 单次字符 ${curK}k`);
-        state.log('  用法: /readlimit <MB> (1-100) 调整文件大小上限; 设置面板中 ; \' 调字符数');
+        state.log('  用法: /readlimit <MB> (1-500) 调整文件大小上限; 设置面板中 ; \' 调字符数');
         render();
         break;
       }
       const mb = parseInt(arg, 10);
-      if (!Number.isFinite(mb) || mb < 1 || mb > 100) {
-        state.log('◍ 请输入 1-100 之间的数字 (MB)');
+      if (!Number.isFinite(mb) || mb < 1 || mb > 500) {
+        state.log('◍ 请输入 1-500 之间的数字 (MB)');
         render();
         break;
       }
@@ -2781,16 +2801,16 @@ function handleSettingsKey(str, key) {
     render(); return true;
   }
 
-  // 读取文件大小上限 (MB): < > 调整, 范围 1-100MB
+  // 读取文件大小上限 (MB): < > 调整, 范围 1-500MB
   if (str === '<' || str === ',') {
-    const mb = Math.max(1, Math.round(getMaxReadSize() / 1048576) - 1);
+    const mb = Math.max(1, Math.round(getMaxReadSize() / 1048576) - 5);
     cfg.maxFileReadSize = mb * 1048576;
     state.log(`▸ 读取文件大小上限: ${mb}MB`);
     saveConfig(cfg);
     render(); return true;
   }
   if (str === '>' || str === '.') {
-    const mb = Math.min(100, Math.round(getMaxReadSize() / 1048576) + 1);
+    const mb = Math.min(500, Math.round(getMaxReadSize() / 1048576) + 5);
     cfg.maxFileReadSize = mb * 1048576;
     state.log(`▸ 读取文件大小上限: ${mb}MB`);
     saveConfig(cfg);
