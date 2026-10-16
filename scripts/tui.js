@@ -88,7 +88,7 @@ const c = {
   pinkBright: '\x1b[38;5;218m',  // 亮粉 (分割线/齿轮)
   cyan: '\x1b[38;5;115m',        // 青灰
   logoGray: '\x1b[38;5;245m',    // logo 前三字母 (灰)
-  logoBlue: '\x1b[38;5;61m',     // logo 后三字母 (蓝黑)
+  logoBlue: '\x1b[38;5;18m',     // logo 后三字母 (蓝黑)
   border: '\x1b[38;5;238m',      // 边框灰
 };
 
