@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.11',
+  version: '0.2.12',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -86,7 +86,9 @@ const c = {
   red: '\x1b[38;5;174m',         // 暗红 (错误)
   pink: '\x1b[38;5;175m',        // 藕粉 (最终输出)
   pinkBright: '\x1b[38;5;218m',  // 亮粉 (分割线/齿轮)
-  cyan: '\x1b[38;5;115m',        // 青灰 (logo)
+  cyan: '\x1b[38;5;115m',        // 青灰
+  logoGray: '\x1b[38;5;245m',    // logo 前三字母 (灰)
+  logoBlue: '\x1b[38;5;61m',     // logo 后三字母 (蓝黑)
   border: '\x1b[38;5;238m',      // 边框灰
 };
 
@@ -101,13 +103,18 @@ const PIXEL_FONT = {
 
 function renderPixelLogo() {
   const lines = ['', '', '', '', ''];
-  for (const ch of 'ORCODE') {
-    const glyph = PIXEL_FONT[ch] || PIXEL_FONT.O;
+  const letters = 'ORCODE'.split('');
+  for (let li = 0; li < letters.length; li++) {
+    const glyph = PIXEL_FONT[letters[li]] || PIXEL_FONT.O;
     for (let i = 0; i < 5; i++) {
       lines[i] += glyph[i] + ' ';
     }
   }
-  return lines;
+  // 前三字母 (ORC) 灰色, 后三字母 (ODE) 蓝黑色
+  const grayLen = 3 * 6; // 每字母占 6 列 (5 点 + 1 空格)
+  return lines.map(line =>
+    `${c.logoGray}${line.slice(0, grayLen)}${c.reset}${c.logoBlue}${line.slice(grayLen)}${c.reset}`
+  );
 }
 
 // ============ 岗位定义 ============
@@ -161,6 +168,8 @@ class TUIState {
     this.cursorPosition = 0; // 光标位置 (字符索引)
     this.selectedIndex = 0;
     this.guideIndex = 0;
+    this.guideScroll = 0;          // 指令小窗口滚动偏移 (可见首行的 filtered 索引)
+    this._guideGeom = null;        // 指令小窗口几何信息 (鼠标悬停/点击/滚轮用)
     this.settingsOpen = false;
     this.settingsPos = 0;
     this.settingsScroll = 0; // 设置面板内滚动偏移
@@ -895,7 +904,7 @@ async function webSearch(query, limit = 8) {
   const url = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(q);
   const res = await fetch(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ORcode/0.2.11',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ORcode/0.2.12',
       'Accept': 'text/html,application/xhtml+xml',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
     },
@@ -1040,9 +1049,9 @@ function render() {
   const divX = mainW + 1;
   const cfg = state.config;
 
-  // ---------- 左上: 像素 ORCODE 标识 ----------
+  // ---------- 左上: 像素 ORCODE 标识 (前三字母灰 / 后三字母蓝黑, 颜色内嵌) ----------
   renderPixelLogo().forEach((line, i) => {
-    write(2, 2 + i, line, c.cyan);
+    write(2, 2 + i, line);
   });
 
   // ---------- 左上: 路径与当前岗位 ----------
@@ -1905,47 +1914,82 @@ async function demoQuestionnaire() {
   render();
 }
 
-// ---------- 指令面板 (参考 OpenCode 风格) ----------
+// ---------- 指令面板 (OpenCode 风格小窗口, 支持滚动) ----------
 function renderCommandGuide() {
   const W = state.terminalWidth;
   const H = state.terminalHeight;
   const filtered = state.filteredCommands();
+  state._guideGeom = null;
   if (filtered.length === 0) {
-    write(4, H - 6, `${c.faint}(无匹配命令)${c.reset}`, c.faint);
+    const bx = 3;
+    moveCursor(bx, H - 6);
+    process.stdout.write(`${c.border}┌${'─'.repeat(22)}┐${c.reset}`);
+    moveCursor(bx, H - 5);
+    process.stdout.write(`${c.border}│${c.reset}${c.faint} (无匹配命令)${' '.repeat(9)}${c.border}│${c.reset}`);
+    moveCursor(bx, H - 4);
+    process.stdout.write(`${c.border}└${'─'.repeat(22)}┘${c.reset}`);
     return;
   }
   if (state.guideIndex >= filtered.length) state.guideIndex = filtered.length - 1;
   if (state.guideIndex < 0) state.guideIndex = 0;
 
-  const panelH = filtered.length;
-  const infoH = 4;
-  let py = H - 5 - infoH - panelH;
-  if (py < 2) py = 2;
+  const pw = 52;                                   // 窗口宽 (含边框)
+  const px = 3;                                    // 左栏内贴左
+  const inputY = H - 3;                            // 输入行
+  const boxBottom = inputY - 2;                    // 窗口底边在输入行上方 2 行
+  const maxVis = Math.max(1, Math.min(12, boxBottom - 4)); // 最多可见行数 (顶部留 3 行给 logo)
+  const visRows = Math.min(filtered.length, maxVis);
+  const boxH = visRows + 2;
+  const py = Math.max(2, boxBottom - boxH + 1);
 
-  filtered.forEach(([cmd, desc], i) => {
-    const selected = i === state.guideIndex;
-    const label = `  ${cmd.padEnd(11)}${desc}`;
-    const padded = label + ' '.repeat(Math.max(0, 46 - displayWidth(label)));
-    moveCursor(4, py + i);
+  // 滚动: 保证 guideIndex 可见
+  const maxScroll = Math.max(0, filtered.length - visRows);
+  if (state.guideScroll > maxScroll) state.guideScroll = maxScroll;
+  if (state.guideScroll < 0) state.guideScroll = 0;
+  if (state.guideIndex < state.guideScroll) state.guideScroll = state.guideIndex;
+  if (state.guideIndex >= state.guideScroll + visRows) state.guideScroll = state.guideIndex - visRows + 1;
+
+  // 边框
+  moveCursor(px, py);
+  process.stdout.write(`${c.border}┌${'─'.repeat(pw - 2)}┐${c.reset}`);
+  for (let i = 0; i < visRows; i++) {
+    moveCursor(px, py + 1 + i);
+    process.stdout.write(`${c.border}│${c.reset}`);
+    moveCursor(px + pw - 1, py + 1 + i);
+    process.stdout.write(`${c.border}│${c.reset}`);
+  }
+  moveCursor(px, py + boxH - 1);
+  process.stdout.write(`${c.border}└${'─'.repeat(pw - 2)}┘${c.reset}`);
+
+  // 行内容 (可见窗口)
+  for (let i = 0; i < visRows; i++) {
+    const idx = state.guideScroll + i;
+    const [cmd, desc] = filtered[idx];
+    const selected = idx === state.guideIndex;
+    const label = ` ${cmd.padEnd(12)}${desc}`;
+    const padded = label + ' '.repeat(Math.max(0, pw - 3 - displayWidth(label)));
+    moveCursor(px + 1, py + 1 + i);
     if (selected) {
       process.stdout.write(`${c.reverse}${c.text}${padded}${c.reset}`);
     } else {
-      process.stdout.write(`${c.sub}${cmd.padEnd(13)}${c.faint}${desc}${c.reset}`);
+      const descPad = ' '.repeat(Math.max(0, pw - 4 - 12 - displayWidth(desc)));
+      process.stdout.write(`${c.sub} ${cmd.padEnd(12)}${c.reset}${c.faint}${desc}${descPad}${c.reset}`);
     }
-  });
+  }
 
-  let iy = py + panelH + 1;
-  moveCursor(4, iy);
-  process.stdout.write(`${c.accent}▎${c.reset}`);
-  const agentInfo = `ORcode — HOR-loop · ${state.config.defaultModel?.name || '未配置模型'} · ${POSITIONS.length} 岗位`;
-  moveCursor(6, iy);
-  process.stdout.write(`${c.text}${truncateAnsi(agentInfo, W - 10)}${c.reset}`);
-  iy++;
-  moveCursor(6, iy);
-  process.stdout.write(`${c.faint}tab agents   ctrl+p commands${c.reset}`);
-  iy++;
-  moveCursor(6, iy);
-  process.stdout.write(`${c.yellow}●${c.reset} ${c.faint}Tip 直接输入文字 = 单模型调用 · /hor-loop = 多模型协作 · ↑↓ 选择${c.reset}`);
+  // 内嵌滚动条 (右边框上, 有溢出时显示)
+  if (filtered.length > visRows) {
+    const track = visRows;
+    const thumbLen = Math.max(1, Math.round(track * visRows / filtered.length));
+    const thumbPos = Math.round((track - thumbLen) * (maxScroll === 0 ? 0 : state.guideScroll / maxScroll));
+    for (let i = 0; i < track; i++) {
+      if (i < thumbPos || i >= thumbPos + thumbLen) continue;
+      moveCursor(px + pw - 1, py + 1 + i);
+      process.stdout.write(`${c.accent}█${c.reset}`);
+    }
+  }
+
+  state._guideGeom = { px, py, pw, ph: boxH, visRows, top: state.guideScroll, count: filtered.length };
 }
 
 // ---------- 设置面板 (含五步添加模型) ----------
@@ -2765,21 +2809,15 @@ function handleMouseHover(col, row) {
     }
     return;
   }
-  // 指令面板: 悬停移动选中命令
+  // 指令小窗口: 悬停移动选中命令 (几何由 renderCommandGuide 记录)
   if (state.guideActive && !state.running) {
-    const filtered = state.filteredCommands();
-    const panelH = filtered.length;
-    if (panelH === 0) return;
-    const infoH = 4;
-    let py = state.terminalHeight - 5 - infoH - panelH;
-    if (py < 2) py = 2;
-    for (let i = 0; i < filtered.length; i++) {
-      if (row === py + i && col >= 4 && col <= 50) {
-        if (state.guideIndex !== i) {
-          state.guideIndex = i;
-          render();
-        }
-        return;
+    const g = state._guideGeom;
+    if (g && col >= g.px && col <= g.px + g.pw && row > g.py && row < g.py + g.ph) {
+      const vis = row - g.py - 1;
+      const idx = g.top + vis;
+      if (vis >= 0 && vis < g.visRows && idx < g.count && state.guideIndex !== idx) {
+        state.guideIndex = idx;
+        render();
       }
     }
   }
@@ -2875,17 +2913,15 @@ function handleMouseClick(col, row) {
     }
   }
 
-  // 指令面板激活时: 点击命令项执行
+  // 指令小窗口激活时: 点击命令项执行
   if (state.guideActive) {
-    const filtered = state.filteredCommands();
-    const panelH = filtered.length;
-    const infoH = 4;
-    let py = H - 5 - infoH - panelH;
-    if (py < 2) py = 2;
-    for (let i = 0; i < filtered.length; i++) {
-      if (row === py + i && col >= 4 && col <= 50) {
-        executeGuideCommand(filtered[i][0]);
-        return;
+    const g = state._guideGeom;
+    if (g && col >= g.px && col <= g.px + g.pw && row > g.py && row < g.py + g.ph) {
+      const vis = row - g.py - 1;
+      const idx = g.top + vis;
+      if (vis >= 0 && vis < g.visRows && idx < g.count) {
+        state.guideIndex = idx;
+        executeGuideCommand(state.filteredCommands()[idx][0]);
       }
     }
     return;
@@ -3084,7 +3120,17 @@ function parseInput() {
         } else if (btn >= 64 && btn <= 67 && mouse[4] === 'M') {
           // 滚轮事件: 64=up, 65=down, 66=left, 67=right
           const wheelUp = btn === 64 || btn === 66;
-          // ① 设置面板内 → 设置面板滚动 (最高优先, 面板是覆盖层; 几何由 renderSettingsPanel 记录)
+          // ⓪ 指令小窗口内 → 窗口滚动 (覆盖层, 最高优先)
+          if (state.guideActive && !state.running) {
+            const gg = state._guideGeom;
+            if (gg && col >= gg.px && col <= gg.px + gg.pw && row >= gg.py && row <= gg.py + gg.ph) {
+              const delta = wheelUp ? -2 : 2;
+              const max = Math.max(0, gg.count - gg.visRows);
+              state.guideScroll = Math.max(0, Math.min(max, state.guideScroll + delta));
+              render();
+            }
+          }
+          // ① 设置面板内 → 设置面板滚动 (面板是覆盖层; 几何由 renderSettingsPanel 记录)
           if (state.settingsOpen) {
             const g = state._settingsGeom;
             if (g && col >= g.px && col <= g.px + g.pw && row >= g.py && row <= g.py + g.ph) {
@@ -3399,6 +3445,13 @@ async function handleKey(str, key) {
       state.guideIndex = Math.min(filtered.length - 1, state.guideIndex + 1);
       render(); return;
     }
+    if (key.name === 'pageup' || key.name === 'pagedown') {
+      const vis = (state._guideGeom && state._guideGeom.visRows) || 8;
+      state.guideIndex = key.name === 'pageup'
+        ? Math.max(0, state.guideIndex - vis)
+        : Math.min(filtered.length - 1, state.guideIndex + vis);
+      render(); return;
+    }
     if (key.name === 'return' || key.name === 'enter') {
       if (filtered.length > 0) {
         executeGuideCommand(filtered[state.guideIndex][0]);
@@ -3608,6 +3661,10 @@ module.exports = {
     handleSettingsKey: (str, key) => handleSettingsKey(str, key),
     handleSettingsButton: (action, arg) => handleSettingsButton(action, arg),
     handleMouseClick: (col, row) => handleMouseClick(col, row),
+    handleMouseHover: (col, row) => handleMouseHover(col, row),
+    renderPixelLogo,
+    renderCommandGuide: () => renderCommandGuide(),
+    executeGuideCommand: (cmd) => executeGuideCommand(cmd),
     cycleDefaultModel: () => cycleDefaultModel(),
     cyclePositionModel: (idx) => cyclePositionModel(idx),
     closeSession: (idx) => closeSession(idx)
