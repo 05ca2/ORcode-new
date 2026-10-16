@@ -52,8 +52,9 @@ function check(name, cond) {
   check('文件大小 增/减按钮存在', actions.includes('size-') && actions.includes('size+'));
   check('字符上限 增/减按钮存在', actions.includes('chars-') && actions.includes('chars+'));
   check('初始模型点击按钮存在', actions.includes('defaultModel'));
-  check('岗位行点击按钮存在 (4 个)', actions.filter(a => a === 'position').length === 4);
-  check('添加模型按钮存在', actions.includes('addModel'));
+  const posCount = actions.filter(a => a === 'position').length;
+  check('岗位行点击按钮已登记 (首屏可见, 不超总数)', posCount >= 4 && posCount <= Object.keys(state.positions).length);
+  check('添加模型按钮存在 (需滚到底, 见下文)', true);
   // 按钮都落在面板内容区内 (不压边框、不进底部提示行)
   const inBounds = g.buttons.every(b =>
     b.row >= g.py + 2 && b.row <= g.py + g.ph - 3 &&
@@ -117,9 +118,12 @@ function check(name, cond) {
   tui.__test.handleMouseClick(posBtn.x1, posBtn.row);
   check('再点同一岗位 = 循环换模型', state.positions[Object.keys(state.positions)[1]]?.model !== posModel0);
 
-  // 添加模型按钮
-  tui.__test.handleMouseClick(g.buttons.find(b => b.action === 'addModel').x1,
-                              g.buttons.find(b => b.action === 'addModel').row);
+  // 添加模型按钮 (岗位增多后首屏可能放不下, 先滚到底再找)
+  state.settingsScroll = state._settingsMaxScroll || 0;
+  tui.__test.renderSettingsPanel();
+  const addBtn = state._settingsGeom.buttons.find(b => b.action === 'addModel');
+  check('添加模型按钮存在 (滚到底后)', !!addBtn);
+  tui.__test.handleMouseClick(addBtn.x1, addBtn.row);
   check('点击 [+ 添加模型] 进入五步流程', state.addStep === 'provider');
   // 取消添加
   state.addStep = null;
@@ -147,12 +151,25 @@ function check(name, cond) {
   tui.__test.renderSettingsPanel();
   const g2 = state._settingsGeom;
   check('矮终端触发滚动 (maxScroll > 0)', (state._settingsMaxScroll || 0) > 0);
-  // 滚到最底
+  // 滚到最底: 按钮 (若有) 不得越过面板底边
   state.settingsScroll = state._settingsMaxScroll;
   tui.__test.renderSettingsPanel();
   const g3 = state._settingsGeom;
-  const allInside = g3.buttons.every(b => b.row <= g3.py + g3.ph - 3);
-  check('滚到最底时按钮不越过面板底边', allInside && g3.buttons.length > 0);
+  const allInside = g3.buttons.every(b => b.row >= g3.py + 2 && b.row <= g3.py + g3.ph - 3);
+  check('滚到最底时按钮不越过面板边界', allInside);
+  // 逐档滚动: 任何位置按钮都不得画出面板
+  let anyOut = false;
+  for (let s = 0; s <= (state._settingsMaxScroll || 0); s += 3) {
+    state.settingsScroll = s;
+    tui.__test.renderSettingsPanel();
+    const gg = state._settingsGeom;
+    if (!gg.buttons.every(b => b.row >= gg.py + 2 && b.row <= gg.py + gg.ph - 3)) anyOut = true;
+  }
+  check('各滚动位置按钮均在面板内', !anyOut);
+  // 回到顶部应有点击按钮
+  state.settingsScroll = 0;
+  tui.__test.renderSettingsPanel();
+  check('面板内存在可点击按钮', state._settingsGeom.buttons.length > 0);
   // 滚到最底后应能看到最后一条快捷键 (/help 显示帮助)
   check('滚到底可见最后一条快捷键', out.includes('/help'));
   // settingsScroll 被钳制在 maxScroll

@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.12',
+  version: '0.2.13',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -118,12 +118,38 @@ function renderPixelLogo() {
 }
 
 // ============ 岗位定义 ============
-const POSITIONS = [
-  { key: 'director', label: '指挥 Director', desc: '拆解任务、分派岗位' },
-  { key: 'planner', label: '规划 Planner', desc: '制定顺序执行计划' },
-  { key: 'worker', label: '执行 Workers', desc: '多岗位并发协作执行' },
-  { key: 'verifier', label: '检验 Verifier', desc: '核查结果并驱动修复' }
+// ============ 岗位树 (多模型协作) ============
+// 流程层 (4 个父节点) + 职能层 (子分支). 渲染时展开为带子分支的工作树.
+const POSITION_TREE = [
+  { key: 'director', label: '指挥 Director', desc: '拆解任务、分派岗位', children: [
+    { key: 'pm',          label: '产品经理 PM',               desc: '把模糊需求拆为可执行 user story' },
+    { key: 'coordinator', label: '协调员 Coordinator',        desc: '汇总各岗结论、决定下一步路由' },
+  ]},
+  { key: 'planner',  label: '规划 Planner',  desc: '制定顺序执行计划', children: [
+    { key: 'architect',   label: '架构师 Architect',          desc: '定方案、模块拆分' },
+  ]},
+  { key: 'worker',   label: '执行 Workers',  desc: '多岗位并发协作执行', children: [
+    { key: 'researcher',  label: '研究员 Researcher',         desc: '联网检索、查证事实' },
+    { key: 'data',        label: '数据师 Data Analyst',       desc: '处理表格、统计与可视化' },
+    { key: 'coder',       label: '程序员 Coder',              desc: '按方案写/改代码' },
+    { key: 'tester',      label: '测试员 Tester',             desc: '写用例、自查边界' },
+    { key: 'security',    label: '安全审计 Auditor',          desc: '查漏洞/越权/注入风险' },
+    { key: 'critic',      label: '批评家 Critic',             desc: '唱反调、找逻辑漏洞' },
+    { key: 'editor',      label: '润色官 Editor',             desc: '调语气、去 AI 味' },
+    { key: 'translator',  label: '翻译官 Translator',          desc: '中英互译、术语对齐' },
+    { key: 'summarizer',  label: '摘要员 Summarizer',         desc: '长输出压成要点' },
+  ]},
+  { key: 'verifier', label: '检验 Verifier', desc: '核查结果并驱动修复', children: [] },
 ];
+
+// 扁平化 (父节点 + 子节点按展示顺序), 供 selectedIndex 导航 / state.positions 初始化 / 设置面板使用
+const POSITIONS = [];
+POSITION_TREE.forEach(p => {
+  p.children = p.children || [];
+  POSITIONS.push(p);
+  p.children.forEach(c => { c.parent = p.key; POSITIONS.push(c); });
+});
+const TOP_POSITION_KEYS = POSITION_TREE.map(p => p.key);
 
 // ============ 指令面板命令 ============
 const GUIDE_COMMANDS = [
@@ -173,6 +199,9 @@ class TUIState {
     this.settingsOpen = false;
     this.settingsPos = 0;
     this.settingsScroll = 0; // 设置面板内滚动偏移
+    this.treeScroll = 0;     // 工作树纵向滚动偏移 (内容超高时)
+    this.treeCollapsed = {}; // 工作树折叠状态: {positionKey: true} 收起其子分支
+    this._treeFocusToken = null; // 上次自动跟随的焦点 (选中/执行目标@终端尺寸), 变化才跟随
     // 添加模型五步流程: provider → baseUrl → apiKey → modelId → displayName → afterAdd
     this.addStep = null;
     this.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
@@ -362,6 +391,7 @@ function applyFreshSession() {
   state.permissionRequest = null;
   state._permGeom = null;
   state.historyScroll = 0;   // 新会话从最新对话开始看
+  state.treeScroll = 0;      // 工作树回到顶部
   const positions = {};
   POSITIONS.forEach(p => {
     positions[p.key] = {
@@ -1133,44 +1163,103 @@ function render() {
     }
   }
 
-  // ---------- 右栏: 工作树 ----------
+  // ---------- 右栏: 工作树 (带子分支 + 折叠 + 纵向滚动) ----------
   const treeX = divX + 1;
-  write(treeX, 2, `▸ 工作树 · 多模型协作`, c.sub);
+  const treeTitle = truncateAnsi(`▸ 工作树 · 多模型协作`, Math.max(8, treeW - 1));
+  write(treeX, 2, treeTitle, c.sub);
+  const treeAvail = Math.max(16, treeW - 1);
 
-  let ty = 4;
-  POSITIONS.forEach((p, idx) => {
-    const pos = state.positions[p.key];
-    const selected = state.selectedIndex === idx;
-    const inSub = state.subSession === p.key;
-    const active = state.activePos === p.key;
-    const icon = active ? '◈' : (inSub ? '◐' : getStatusIcon(pos.status));
-    const arrow = active ? '▶' : (selected ? '▸' : ' ');
-    // 正在执行的岗位用荧光粉高亮, 其次是选中的
-    const rowColor = active ? c.pinkBright : (inSub ? c.pink : (selected ? c.text : c.sub));
-    const activeTag = active ? `  ${c.pinkBright}◀ 执行中${c.reset}` : (inSub ? `  ${c.pink}[子会话]${c.reset}` : '');
-    write(treeX, ty, `${arrow} ${icon} ${p.label}  ${c.sub}${pos.model}${c.reset}${activeTag}`, rowColor);
-    ty++;
-    const isLast = idx === POSITIONS.length - 1;
-    const connector = isLast ? '  ' : '│ ';
-    write(treeX + 2, ty, `${connector}   ${c.faint}${p.desc}${c.reset}`, c.faint);
-    ty++;
+  // 行缓冲: 先按树形收集所有行 (节点行 + 描述行), 再按视窗切片写出, 支持滚动/折叠
+  const selKey = (state.selectedIndex >= 0 && POSITIONS[state.selectedIndex]) ? POSITIONS[state.selectedIndex].key : null;
+  const treeRows = [];
+  POSITION_TREE.forEach((tp) => {
+    const hasKids = !!(tp.children && tp.children.length);
+    const collapsed = !!state.treeCollapsed[tp.key];
+    const toggle = hasKids ? (collapsed ? ' ▸' : ' ▾') : '';
+    treeRows.push({ kind: 'node', node: tp, prefixBar: '', connector: '', isParent: hasKids, toggle });
+    treeRows.push({ kind: 'desc', node: tp, prefixBar: '', connector: '' });
+    if (hasKids && !collapsed) {
+      tp.children.forEach((ch, ci) => {
+        const isLast = ci === tp.children.length - 1;
+        const bar = isLast ? '  ' : '│ ';
+        const conn = isLast ? '└─ ' : '├─ ';
+        treeRows.push({ kind: 'node', node: ch, prefixBar: bar, connector: conn });
+        if (selKey === ch.key) treeRows.push({ kind: 'desc', node: ch, prefixBar: bar, connector: conn });
+      });
+    }
   });
 
+  // 视窗: 底部 4 行是输入框区 (H-4 分割线/H-3 输入/H-1 状态栏), 另留状态/计数/提示 3 行 + 1 空行
+  const treeVisRows = Math.max(3, H - 12);
+  const treeMaxScroll = Math.max(0, treeRows.length - treeVisRows);
+  if (state.treeScroll > treeMaxScroll) state.treeScroll = treeMaxScroll;
+  let treeScroll = Math.max(0, state.treeScroll);
+  // 焦点行 (执行中 > 选中): 仅在"焦点变化"或"终端尺寸变化"时自动跟随, 手动滚轮滚动不被弹回
+  const focusKey = state.activePos || selKey;
+  let focusIdx = treeRows.findIndex(r => r.node.key === focusKey);
+  if (focusIdx < 0) focusIdx = treeRows.findIndex(r => r.node.key === selKey);
+  const focusToken = `${focusKey || ''}@${W}x${H}`;
+  if (focusIdx >= 0 && state._treeFocusToken !== focusToken) {
+    if (focusIdx < treeScroll) treeScroll = focusIdx;
+    if (focusIdx >= treeScroll + treeVisRows) treeScroll = focusIdx - treeVisRows + 1;
+  }
+  state._treeFocusToken = focusToken;
+  treeScroll = Math.max(0, Math.min(treeMaxScroll, treeScroll));
+  state.treeScroll = treeScroll;   // 写回实际滚动位 (滚轮增量基于真实位置)
+
+  let ty = 4;
+  const treeGeomRows = [];
+  treeRows.slice(treeScroll, treeScroll + treeVisRows).forEach((r) => {
+    const y = ty;
+    if (r.kind === 'desc') {
+      const pad = r.prefixBar.length + r.connector.length;
+      write(treeX + pad + 2, y, truncateAnsi(r.node.desc, Math.max(8, treeAvail - pad - 2)), c.faint);
+      ty++;
+      return;
+    }
+    const key = r.node.key;
+    const sel = selKey === key;
+    const inSub = state.subSession === key;
+    const active = state.activePos === key;
+    const icon = active ? '◈' : (inSub ? '◐' : getStatusIcon(state.positions[key]?.status));
+    const arrow = active ? '▶' : (sel ? '▸' : ' ');
+    const rowColor = active ? c.pinkBright : (inSub ? c.pink : (sel ? c.text : c.sub));
+    const model = state.positions[key]?.model || '-';
+    const activeTag = active ? ' ◀执行中' : (inSub ? ' [子会话]' : '');
+    const toggle = r.toggle || '';
+    // 宽度控制: 前缀+箭头/图标+标签+模型+标记 不超出面板右边界
+    const prefixW = r.prefixBar.length + r.connector.length + 4; // arrow+' '+icon+' '
+    const reserve = displayWidth(toggle) + displayWidth(activeTag) + 2 + displayWidth(String(model));
+    const labelMax = treeAvail - prefixW - reserve;
+    const label = labelMax > 6 ? truncateAnsi(r.node.label, labelMax) : r.node.label;
+    const lineW = prefixW + displayWidth(label) + 2 + displayWidth(String(model)) + displayWidth(activeTag);
+    write(treeX, y, `${r.prefixBar}${r.connector}${arrow} ${icon} ${label}  ${c.sub}${model}${c.reset}${activeTag}${toggle}`, rowColor);
+    treeGeomRows.push({
+      y, key, isParent: r.isParent,
+      toggleX1: treeX + lineW,
+      toggleX2: treeX + lineW + displayWidth(toggle) - 1
+    });
+    ty++;
+  });
+  state._treeGeom = { x: treeX, scroll: treeScroll, maxScroll: treeMaxScroll, visRows: treeVisRows, total: treeRows.length, rows: treeGeomRows };
+
   ty++;
-  const doneCount = POSITIONS.filter(p => state.positions[p.key].status === 'completed').length;
+  const doneCount = TOP_POSITION_KEYS.filter(k => state.positions[k].status === 'completed').length;
   if (state.subSession) {
     write(treeX, ty, `子会话中 · Esc 返回主会话`, c.pink); ty++;
   } else if (state.running && state.activePos) {
     const ap = POSITIONS.find(p => p.key === state.activePos);
-    write(treeX, ty, `▶ 执行中: ${ap ? ap.label : state.activePos} · ${doneCount}/${POSITIONS.length} 完成`, c.pinkBright); ty++;
+    write(treeX, ty, `▶ 执行中: ${ap ? ap.label : state.activePos} · ${doneCount}/${TOP_POSITION_KEYS.length} 完成`, c.pinkBright); ty++;
   } else if (state.running) {
-    write(treeX, ty, `运行中 · ${doneCount}/${POSITIONS.length} 岗位完成`, c.yellow); ty++;
+    write(treeX, ty, `运行中 · ${doneCount}/${TOP_POSITION_KEYS.length} 岗位完成`, c.yellow); ty++;
   } else if (state.waitingForTask) {
     write(treeX, ty, `等待任务输入 · 回车启动 HOR-loop`, c.accent); ty++;
   } else {
     write(treeX, ty, `待命 · /hor-loop 启动协作`, c.faint); ty++;
   }
-  write(treeX, ty, `${POSITIONS.length} 个岗位 · ${state.config.models.length} 个模型 · ${state.tokens} tok`, c.faint);
+  const scrollHint = state._treeGeom && state._treeGeom.maxScroll > 0 ? ` · 滚轮可滚 ${state._treeGeom.scroll}/${state._treeGeom.maxScroll}` : '';
+  write(treeX, ty, truncateAnsi(`${POSITIONS.length} 个岗位 (${TOP_POSITION_KEYS.length} 流程 + ${POSITIONS.length - TOP_POSITION_KEYS.length} 职能) · ${state.config.models.length} 模型 · ${state.tokens} tok`, Math.max(8, treeAvail)), c.faint);
+  write(treeX, ty + 1, truncateAnsi(`点行尾 ▸/▾ 折叠 · tab 切换${scrollHint}`, Math.max(8, treeAvail)), c.faint);
 
   // ---------- 底部: 输入框 ----------
   const inputY = H - 3;
@@ -1197,7 +1286,7 @@ function render() {
   if (state.currentInput || !placeholder) {
     write(2, inputY, `${prompt}${state.currentInput}`, c.text);
   } else {
-    write(2, inputY, `${prompt}${placeholder}`, (state.waitingForTask || state.subSession) ? c.accent : c.faint);
+    write(2, inputY, truncateAnsi(`${prompt}${placeholder}`, Math.max(10, divX - 3)), (state.waitingForTask || state.subSession) ? c.accent : c.faint);
   }
   // 重新定位光标到正确位置 (光标可能在中间) — 先夹紧防越界
   clampCursor();
@@ -1999,7 +2088,9 @@ function renderSettingsPanel() {
   const cfg = state.config;
   const adding = !!state.addStep;
   const pw = 52;
-  const ph = adding ? 26 : 19;
+  // 面板高度自适应: 终端越高面板越高 (最多 30 行), 但不超出屏幕; 添加模型流程固定较高
+  const wantPh = adding ? 26 : Math.min(30, Math.max(19, H - 8));
+  const ph = Math.max(8, Math.min(H - 2, wantPh));
   const px = Math.max(4, Math.floor((W - Math.max(30, Math.floor(W * 0.34))) * 0.5) - Math.floor(pw / 2));
   const py = Math.max(1, Math.floor((H - ph) / 2));
 
@@ -2838,7 +2929,6 @@ function handleMouseClick(col, row) {
   const H = state.terminalHeight;
   const treeW = Math.max(30, Math.floor(W * 0.34));
   const divX = W - treeW;
-  const treeX = divX + 1;
 
   // 标签栏点击 (y===1): 切换会话或新建
   if (row === 1 && state._tabsGeom) {
@@ -2927,17 +3017,23 @@ function handleMouseClick(col, row) {
     return;
   }
 
-  // 点击工作树岗位行 → director 选中, 其他岗位进入子会话
-  for (let i = 0; i < POSITIONS.length; i++) {
-    const rowY = 4 + i * 2;
-    if (row === rowY && col >= treeX) {
-      const key = POSITIONS[i].key;
-      state.selectedIndex = i;
-      if (key === 'director') {
+  // 点击工作树岗位行 → 选中; director 保持主会话, 其他进入子会话; 点行尾 ▸/▾ 折叠或展开子分支
+  const tg = state._treeGeom;
+  if (tg && col >= tg.x) {
+    const hit = tg.rows.find(r => r.y === row);
+    if (hit) {
+      if (hit.isParent && hit.toggleX2 >= hit.toggleX1 && col >= hit.toggleX1 && col <= hit.toggleX2) {
+        state.treeCollapsed[hit.key] = !state.treeCollapsed[hit.key];
+        render();
+        return;
+      }
+      const idx = POSITIONS.findIndex(p => p.key === hit.key);
+      if (idx >= 0) state.selectedIndex = idx;
+      if (hit.key === 'director') {
         state.log('▸ Director 为主会话 — 其他岗位可点击进入子会话');
         render();
       } else {
-        enterSubSession(key);
+        enterSubSession(hit.key);
       }
       return;
     }
@@ -3139,15 +3235,22 @@ function parseInput() {
               state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
               render();
             }
-          } else if (!state.questionnaire && !state.modelsOpen && !state.permissionRequest
-                     && !state.subSession && state.history.length > 0) {
-            // ② 鼠标在左栏对话历史区 (粉色分割线左侧) → 翻看历史
+          } else if (!state.questionnaire && !state.modelsOpen && !state.permissionRequest) {
+            // ② 无覆盖层: 右栏工作树 → 树滚动; 左栏对话历史 → 翻看历史
             const treeW = Math.max(30, Math.floor(state.terminalWidth * 0.34));
             const divX = state.terminalWidth - treeW;
-            const historyTop = 11, historyBottom = state.terminalHeight - 4;
-            if (col >= 2 && col < divX && row >= historyTop && row < historyBottom) {
-              // wheelUp → 看更早 (historyScroll++); wheelDown → 回近期 (historyScroll--)
-              scrollHistory(wheelUp ? 3 : -3);
+            if (col > divX) {
+              const g = state._treeGeom;
+              if (g && g.maxScroll > 0) {
+                state.treeScroll = Math.max(0, Math.min(g.maxScroll, state.treeScroll + (wheelUp ? -2 : 2)));
+                render();
+              }
+            } else if (!state.subSession && state.history.length > 0) {
+              const historyTop = 11, historyBottom = state.terminalHeight - 4;
+              if (col >= 2 && row >= historyTop && row < historyBottom) {
+                // wheelUp → 看更早 (historyScroll++); wheelDown → 回近期 (historyScroll--)
+                scrollHistory(wheelUp ? 3 : -3);
+              }
             }
           }
         }
@@ -3667,6 +3770,7 @@ module.exports = {
     executeGuideCommand: (cmd) => executeGuideCommand(cmd),
     cycleDefaultModel: () => cycleDefaultModel(),
     cyclePositionModel: (idx) => cyclePositionModel(idx),
+    POSITIONS, POSITION_TREE, TOP_POSITION_KEYS,
     closeSession: (idx) => closeSession(idx)
   }
 };
