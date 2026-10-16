@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.9',
+  version: '0.2.10',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -1798,16 +1798,16 @@ function renderSettingsPanel() {
   const W = state.terminalWidth;
   const H = state.terminalHeight;
   const cfg = state.config;
-  const pw = 52;
   const adding = !!state.addStep;
+  const pw = 52;
   const ph = adding ? 26 : 19;
   const px = Math.max(4, Math.floor((W - Math.max(30, Math.floor(W * 0.34))) * 0.5) - Math.floor(pw / 2));
   const py = Math.max(1, Math.floor((H - ph) / 2));
 
-  // 计算可滚动区域
-  const contentRows = adding ? 24 : 17; // 内容总行数的近似值 (不含标题/边框)
-  const maxScroll = Math.max(0, contentRows - (ph - 5)); // 减去标题和底部提示的高度
-  state.settingsScroll = Math.min(maxScroll, Math.max(0, state.settingsScroll));
+  // 视窗: 内容行可用区域 (py+2 .. py+ph-3), 底部一行留给固定操作提示
+  const viewTop = py + 2;
+  const viewBottom = py + ph - 3;
+  const viewH = viewBottom - viewTop + 1;
 
   // 面板背景 + 边框 (清屏)
   for (let i = 0; i < ph; i++) {
@@ -1827,202 +1827,162 @@ function renderSettingsPanel() {
     process.stdout.write(`${c.border}│${c.reset}`);
   }
 
-  // 滚动条绘制 (位于面板内部右边缘，确保不超出边界)
-  const scrollbarCol = px + pw - 4; // 就在右边框内侧一格
-  const scrollTrackHeight = ph - 5; // 滚动区域高度
-  const scrollVisible = maxScroll > 0;
-  if (scrollVisible) {
-    // 计算滚动滑块大小和位置
-    const ratio = (ph - 5) / contentRows;
-    const thumbHeight = Math.max(1, Math.floor((ph - 5) * ratio));
-    // 滚动轨道
-    for (let i = 0; i < scrollTrackHeight; i++) {
-      moveCursor(scrollbarCol, py + 2 + i);
+  // ---------- 行缓冲: 先构建逻辑内容行, 再按滚动窗口裁剪绘制 ----------
+  // 每行 = { segs: [{col, s}], btns: [{x1, x2, action, arg}] }
+  // 这样内容再多也只会画出视窗内的行, 不会溢出边框
+  const lines = [];
+  const addLine = (segs, btns) => lines.push({ segs: segs || [], btns: btns || [] });
+  const blank = () => addLine([]);
+  // 可调数值行: label + "< val >" (两侧箭头是可点击按钮)
+  const adjustRow = (label, valStr, vcol, dec, inc) => {
+    const len = valStr.length + 4;
+    addLine(
+      [
+        { col: px + 3, s: `${c.text}${label}${c.reset}` },
+        { col: vcol, s: `${c.faint}< ${c.reset}${c.accent}${valStr}${c.reset}${c.faint} >${c.reset}` }
+      ],
+      [
+        { x1: vcol, x2: vcol + 1, action: dec },
+        { x1: vcol + len - 2, x2: vcol + len - 1, action: inc }
+      ]
+    );
+  };
+
+  if (!adding) {
+    // -- 数值设置 (全部鼠标可点) --
+    adjustRow('并行 Workers 数量', String(cfg.workers), px + pw - 14, 'workers-', 'workers+');
+    adjustRow('验证轮数', String(cfg.verifyRounds), px + pw - 14, 'verify-', 'verify+');
+    adjustRow('读取文件大小上限', `${Math.round(getMaxReadSize() / 1048576)}MB`, px + pw - 16, 'size-', 'size+');
+    adjustRow('单次读取字符上限', `${Math.round(getMaxReadChars() / 1000)}k`, px + pw - 16, 'chars-', 'chars+');
+    // 初始模型 (点击循环切换)
+    addLine(
+      [
+        { col: px + 3, s: `${c.text}初始模型${c.reset}` },
+        { col: px + pw - 20, s: `${c.accent}${truncateAnsi(cfg.defaultModel?.name || '-', 14)}${c.reset}` }
+      ],
+      [{ x1: px + pw - 20, x2: px + pw - 7, action: 'defaultModel' }]
+    );
+    blank();
+    // 岗位模型 (点击选择岗位; 再点同一岗位循环换模型)
+    addLine([{ col: px + 3, s: `${c.sub}岗位模型 ${'─'.repeat(pw - 14)}${c.reset}` }]);
+    POSITIONS.forEach((p, idx) => {
+      const sel = state.settingsPos === idx;
+      const marker = sel ? '▸' : ' ';
+      const model = state.positions[p.key]?.model || cfg.positions[p.key]?.name || '-';
+      addLine(
+        [sel
+          ? { col: px + 3, s: `${c.accent}${marker} ${p.key.padEnd(10)}${c.text}${model}${c.reset}` }
+          : { col: px + 3, s: `${c.faint}${marker} ${p.key.padEnd(10)}${c.sub}${model}${c.reset}` }],
+        [{ x1: px + 3, x2: px + pw - 5, action: 'position', arg: idx }]
+      );
+    });
+    blank();
+    // 可用模型
+    addLine([{ col: px + 3, s: `${c.sub}可用模型 (${cfg.models.length})${c.reset}` }]);
+    if (cfg.models.length === 0) {
+      addLine([{ col: px + 3, s: `${c.yellow}(暂无模型 — 点击下方 [+ 添加模型] 创建)${c.reset}` }]);
+    } else {
+      const names = cfg.models.map(m => m.name).join(' · ');
+      addLine([{ col: px + 3, s: `${c.faint}${truncateAnsi(names, pw - 8)}${c.reset}` }]);
+    }
+    addLine(
+      [{ col: px + 3, s: `${c.accent}[+ 添加模型]${c.reset}` }],
+      [{ x1: px + 3, x2: px + 16, action: 'addModel' }]
+    );
+    blank();
+  } else {
+    // -- 添加模型五步流程 --
+    addLine([{ col: px + 3, s: `${c.sub}── 添加模型 ${'─'.repeat(pw - 16)}${c.reset}` }]);
+    const d = state.addDraft;
+    const steps = [
+      ['1', '供应商名称', d.provider, state.addStep === 'provider'],
+      ['2', 'Base URL', d.baseUrl, state.addStep === 'baseUrl'],
+      ['3', 'API Key', d.apiKey ? '••••••••' : '(未设置)', state.addStep === 'apiKey'],
+      ['4', '模型 ID', d.modelId, state.addStep === 'modelId'],
+      ['5', '显示名称', d.displayName, state.addStep === 'displayName']
+    ];
+    steps.forEach(([num, label, value, isCurrent]) => {
+      const done = value && !isCurrent ? `${c.green}✓${c.reset}` : (isCurrent ? `${c.accent}▸${c.reset}` : `${c.faint}○${c.reset}`);
+      const valColor = isCurrent ? c.accent : c.sub;
+      const display = isCurrent ? `${value || ''}█` : (value || '—');
+      addLine([{ col: px + 3, s: `${done} ${c.faint}${num}.${c.reset} ${c.text}${label.padEnd(6)}${c.reset} ${valColor}${truncateAnsi(display, pw - 20)}${c.reset}` }]);
+    });
+    blank();
+    if (state.addStep === 'afterAdd') {
+      addLine([{ col: px + 3, s: `${c.green}✓ 已添加: ${c.text}${d.displayName}${c.reset} ${c.faint}(${d.provider} / ${d.modelId})${c.reset}` }]);
+      addLine([{ col: px + 3, s: `${c.yellow}回车${c.reset}=继续同一供应商  ${c.yellow}空格${c.reset}=其他供应商  ${c.yellow}s${c.reset}=完成添加` }]);
+    } else {
+      addLine([{ col: px + 3, s: `${c.faint}Esc 取消添加${c.reset}` }]);
+    }
+  }
+
+  // 快捷键帮助 (作为普通内容行参与滚动, 不会再溢出边框)
+  blank();
+  addLine([{ col: px + 3, s: `${c.sub}快捷键 ${'─'.repeat(pw - 12)}${c.reset}` }]);
+  const shortcuts = [
+    ['Ctrl+T', '新建会话'],
+    ['Ctrl+W', '关闭当前会话'],
+    ['Ctrl+1-9', '切换到第 X 个会话'],
+    ['Ctrl+N', '快速新建会话 (备用)'],
+    ['Esc', '取消操作 / 清空输入'],
+    ['Tab', '切换岗位'],
+    ['Ctrl+P', '命令面板 (/)'],
+    ['Ctrl+O', '打开设置'],
+    ['PgUp/PgDn', '翻看对话历史'],
+    ['/perm', '查看路径权限'],
+    ['/help', '显示帮助']
+  ];
+  shortcuts.forEach(([k, desc]) => {
+    const line = `${c.faint}${k.padEnd(12)}${c.text}${desc}${c.reset}`;
+    const displayW = displayWidth(line.replace(/\x1b\[[0-9;]*m/g, ''));
+    const remaining = Math.max(0, pw - 8 - displayW);
+    addLine([{ col: px + 3, s: `${line}${c.faint}${' '.repeat(remaining)}${c.reset}` }]);
+  });
+
+  // ---------- 滚动计算 + 视窗绘制 ----------
+  const total = lines.length;
+  const maxScroll = Math.max(0, total - viewH);
+  state._settingsMaxScroll = maxScroll;
+  state.settingsScroll = Math.min(maxScroll, Math.max(0, state.settingsScroll));
+
+  // 滚动条 (面板内右缘)
+  const scrollbarCol = px + pw - 4;
+  if (maxScroll > 0) {
+    const ratio = viewH / total;
+    const thumbHeight = Math.max(1, Math.floor(viewH * ratio));
+    for (let i = 0; i < viewH; i++) {
+      moveCursor(scrollbarCol, viewTop + i);
       process.stdout.write(`${c.border}│${c.reset}`);
     }
-    // 滚动滑块 (根据滚动位置动态调整)
-    const thumbStart = Math.floor((state.settingsScroll / maxScroll) * (scrollTrackHeight - thumbHeight));
+    const thumbStart = Math.floor((state.settingsScroll / maxScroll) * (viewH - thumbHeight));
     for (let i = 0; i < thumbHeight; i++) {
-      moveCursor(scrollbarCol, py + 2 + thumbStart + i);
+      moveCursor(scrollbarCol, viewTop + thumbStart + i);
       process.stdout.write(`${c.accent}█${c.reset}`);
     }
   }
 
-  let ry = py + 2;
-
-  // 由于滚动, 实际绘制从 state.settingsScroll 开始
-  const visibleStart = state.settingsScroll;
-
-  // 并行 Workers 数量 (row 0)
-  if (visibleStart <= 0) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.text}并行 Workers 数量${c.reset}`);
-    moveCursor(px + pw - 14, ry);
-    process.stdout.write(`${c.faint}< ${c.accent}${cfg.workers}${c.faint} >${c.reset}`);
-    ry++;
-  }
-  // 验证轮数 (row 1)
-  if (visibleStart <= 1) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.text}验证轮数${c.reset}`);
-    moveCursor(px + pw - 14, ry);
-    process.stdout.write(`${c.faint}< ${c.accent}${cfg.verifyRounds}${c.faint} >${c.reset}`);
-    ry++;
-  }
-  // 读取文件大小上限 (row 2) — < > (或 , .) 调整, 单位 MB
-  if (!adding && visibleStart <= 2) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.text}读取文件大小上限 < >${c.reset}`);
-    moveCursor(px + pw - 16, ry);
-    process.stdout.write(`${c.faint}< ${c.accent}${(getMaxReadSize() / 1048576).toFixed(0)}MB${c.faint} >${c.reset}`);
-    ry++;
-  }
-  // 读取字符上限 (row 3) — ; ' 调整
-  if (!adding && visibleStart <= 3) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.text}单次读取字符上限 ; '${c.reset}`);
-    moveCursor(px + pw - 16, ry);
-    process.stdout.write(`${c.faint}< ${c.accent}${(getMaxReadChars() / 1000).toFixed(0)}k${c.faint} >${c.reset}`);
-    ry++;
-  }
-  // 提示 (row 4) - 仅在非添加模式
-  if (!adding && visibleStart <= 4) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.faint}(提示：-/+ 改Workers, [] 改轮数, <> 改文件大小)${c.reset}`);
-    ry++;
-  }
-  // 初始模型 (row 5)
-  if (visibleStart <= 5) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.text}初始模型 (d 更换)${c.reset}`);
-    moveCursor(px + pw - 20, ry);
-    process.stdout.write(`${c.accent}${truncateAnsi(cfg.defaultModel?.name || '-', 14)}${c.reset}`);
-    ry++;
-  }
-  ry += 1; // 空行
-
-  // 岗位模型标题 (row 7)
-  if (visibleStart <= 7) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.sub}岗位模型 (tab 切换 · m 更换模型)${c.reset}`);
-    ry++;
-  }
-  // 岗位列表 (rows 8-11) - 跳过 4 个岗位
-  POSITIONS.forEach((p, idx) => {
-    if (visibleStart <= 8 + idx && visibleStart > 7 + idx) {
-      const sel = state.settingsPos === idx;
-      const marker = sel ? '▸' : ' ';
-      const model = state.positions[p.key]?.model || cfg.positions[p.key]?.name || '-';
-      moveCursor(px + 3, ry);
-      if (sel) {
-        process.stdout.write(`${c.accent}${marker} ${p.key.padEnd(10)}${c.text}${model}${c.reset}`);
-      } else {
-        process.stdout.write(`${c.faint}${marker} ${p.key.padEnd(10)}${c.sub}${model}${c.reset}`);
-      }
-      ry++;
+  // 绘制视窗内的行, 并记录实际画出的按钮几何 (供鼠标点击命中)
+  state._settingsGeom = { px, py, pw, ph, buttons: [] };
+  for (let i = 0; i < viewH; i++) {
+    const li = state.settingsScroll + i;
+    if (li >= total) break;
+    const line = lines[li];
+    const row = viewTop + i;
+    for (const seg of line.segs) {
+      moveCursor(seg.col, row);
+      process.stdout.write(seg.s);
     }
-  });
-
-  ry += 1; // 空行
-
-  // 可用模型列表 (row ~11)
-  if (visibleStart <= 11) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.sub}可用模型 (${cfg.models.length}) — a 添加新模型:${c.reset}`);
-    ry++;
-    if (cfg.models.length === 0) {
-      moveCursor(px + 3, ry);
-      process.stdout.write(`${c.yellow}(暂无模型 — 按 a 添加你的第一个模型)${c.reset}`);
-    } else {
-      const names = cfg.models.map(m => m.name).join(' · ');
-      moveCursor(px + 3, ry);
-      process.stdout.write(`${c.faint}${truncateAnsi(names, pw - 8)}${c.reset}`);
-    }
-    ry += 2; // 空行
-  }
-
-  // 快捷键帮助 (rows ~14+)
-  if (visibleStart <= 14) {
-    moveCursor(px + 3, ry);
-    process.stdout.write(`${c.sub}快捷键 ${'─'.repeat(pw - 12)}${c.reset}`);
-    ry++;
-    const shortcuts = [
-      ['Ctrl+T', '新建会话'],
-      ['Ctrl+W', '关闭当前会话'],
-      ['Ctrl+1-9', '切换到第 X 个会话'],
-      ['Ctrl+N', '快速新建会话 (备用)'],
-      ['Esc', '取消操作 / 清空输入'],
-      ['Tab', '切换岗位'],
-      ['Ctrl+P', '命令面板 (/)'],
-      ['Ctrl+O', '打开设置'],
-      ['PgUp/PgDn', '翻看对话历史'],
-      ['/perm', '查看路径权限'],
-      ['/help', '显示帮助']
-    ];
-    let shown = 0;
-    shortcuts.forEach(([k, desc]) => {
-      if (visibleStart <= 14 + shown) {
-        const line = `${c.faint}${k.padEnd(12)}${c.text}${desc}${c.reset}`;
-        const displayW = displayWidth(line.replace(/\x1b\[[0-9;]*m/g, ''));
-        const remaining = Math.max(0, pw - 8 - displayW);
-        moveCursor(px + 3, ry);
-        process.stdout.write(`${line}${c.faint}${' '.repeat(remaining)}${c.reset}`);
-        ry++;
-      }
-      shown++;
-    });
-    ry += 2; // 空行
-  }
-
-  // 添加模型五步流程 (在设置面板展开时显示)
-  if (adding && state.addStep) {
-    if (visibleStart <= 20) { // 大致行号
-      moveCursor(px + 3, ry);
-      process.stdout.write(`${c.sub}── 添加模型 ${'─'.repeat(pw - 16)}${c.reset}`);
-      ry++;
-      const d = state.addDraft;
-      const steps = [
-        ['1', '供应商名称', d.provider, state.addStep === 'provider'],
-        ['2', 'Base URL', d.baseUrl, state.addStep === 'baseUrl'],
-        ['3', 'API Key', d.apiKey ? '••••••••' : '(未设置)', state.addStep === 'apiKey'],
-        ['4', '模型 ID', d.modelId, state.addStep === 'modelId'],
-        ['5', '显示名称', d.displayName, state.addStep === 'displayName']
-      ];
-      steps.forEach(([num, label, value, isCurrent], si) => {
-        if (visibleStart <= 20 + si) {
-          moveCursor(px + 3, ry);
-          const done = value && !isCurrent ? `${c.green}✓${c.reset}` : (isCurrent ? `${c.accent}▸${c.reset}` : `${c.faint}○${c.reset}`);
-          const valColor = isCurrent ? c.accent : c.sub;
-          const display = isCurrent ? `${value || ''}█` : (value || '—');
-          process.stdout.write(`${done} ${c.faint}${num}.${c.reset} ${c.text}${label.padEnd(6)}${c.reset} ${valColor}${truncateAnsi(display, pw - 20)}${c.reset}`);
-          ry++;
-        }
-      });
-
-      if (state.addStep === 'afterAdd') {
-        if (visibleStart <= 24) {
-          moveCursor(px + 3, ry);
-          process.stdout.write(`${c.green}✓ 已添加: ${c.text}${d.displayName}${c.reset} ${c.faint}(${d.provider} / ${d.modelId})${c.reset}`);
-          ry++;
-          moveCursor(px + 3, ry);
-          process.stdout.write(`${c.yellow}回车${c.reset}=继续同一供应商  ${c.yellow}空格${c.reset}=其他供应商  ${c.yellow}s${c.reset}=完成添加`);
-        }
-      } else {
-        if (visibleStart <= 24) {
-          moveCursor(px + 3, ry);
-          process.stdout.write(`${c.faint}Esc 取消添加${c.reset}`);
-        }
-      }
-      ry++;
+    for (const b of line.btns) {
+      state._settingsGeom.buttons.push({ row, x1: b.x1, x2: b.x2, action: b.action, arg: b.arg });
     }
   }
 
-  // 底部操作提示
+  // 底部操作提示 (固定在面板内最后一行)
   moveCursor(px + 3, py + ph - 2);
   if (adding) {
-    process.stdout.write(`${c.faint}每步输入后按回车确认${c.reset}`);
+    process.stdout.write(`${c.faint}每步输入后按回车确认 · Esc 取消${c.reset}`);
   } else {
-    process.stdout.write(`${c.faint}-/+ 数量 · [] 轮数 · <> 文件大小 · ;' 字符数 · Esc 保存${c.reset}`);
+    process.stdout.write(`${c.faint}点击 < > 调整 · 滚轮/↑↓ 滚动 · Esc 保存${c.reset}`);
   }
 }
 
@@ -2291,6 +2251,7 @@ async function executeGuideCommand(cmd) {
       state.settingsOpen = true;
       state.addStep = null;
       state.settingsPos = 0;
+      state.settingsScroll = 0;
       render();
       break;
     case '/add-model':
@@ -2636,6 +2597,7 @@ function handleMouseClick(col, row) {
     if (state.settingsOpen) {
       state.settingsPos = 0;
       state.addStep = null;
+      state.settingsScroll = 0;
     }
     render();
     return;
@@ -2671,19 +2633,12 @@ function handleMouseClick(col, row) {
     return;
   }
 
-  // 设置面板打开时: 点击岗位行切换
+  // 设置面板打开时: 命中 renderSettingsPanel 登记的按钮几何
   if (state.settingsOpen) {
-    const pw = 52, ph = 24;
-    const px = Math.max(4, Math.floor((W - treeW) * 0.5) - Math.floor(pw / 2));
-    const py = Math.max(1, Math.floor((H - ph) / 2));
-    const firstModelRow = py + 7;
-    for (let i = 0; i < POSITIONS.length; i++) {
-      if (row === firstModelRow + i && col >= px && col <= px + pw) {
-        state.settingsPos = i;
-        render();
-        return;
-      }
-    }
+    const g = state._settingsGeom;
+    if (!g) return;
+    const hit = g.buttons.find(b => row === b.row && col >= b.x1 && col <= b.x2);
+    if (hit) handleSettingsButton(hit.action, hit.arg);
     return;
   }
 
@@ -2744,16 +2699,16 @@ function handleSettingsKey(str, key) {
     return true;
   }
 
-  // 设置面板滚动: 上下箭头
+  // 设置面板滚动: 上下箭头 (maxScroll 由 renderSettingsPanel 按实际内容行计算)
   if (key.name === 'up') {
-    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 24 : 17) : 0) - (state.terminalHeight - 20));
+    const max = state._settingsMaxScroll || 0;
     state.settingsScroll = Math.max(0, state.settingsScroll - 1);
     if (state.settingsScroll > max) state.settingsScroll = max;
     render();
     return true;
   }
   if (key.name === 'down') {
-    const max = Math.max(0, (state.settingsOpen ? (state.addStep ? 24 : 17) : 0) - (state.terminalHeight - 20));
+    const max = state._settingsMaxScroll || 0;
     state.settingsScroll = Math.min(max, state.settingsScroll + 1);
     render();
     return true;
@@ -2765,70 +2720,14 @@ function handleSettingsKey(str, key) {
     return true;
   }
 
-  // d: 更换初始模型 (循环)
+  // d: 更换初始模型 (点击"初始模型"值的键盘等价, 不再在面板中提示)
   if (str === 'd' || str === 'D') {
-    if (cfg.models.length === 0) {
-      state.log('◍ 暂无可用模型 — 先按 a 添加模型');
-      render();
-      return true;
-    }
-    const names = cfg.models.map(m => m.name);
-    const cur = cfg.defaultModel?.name;
-    const idx = names.indexOf(cur);
-    const nextName = names[(idx + 1) % names.length];
-    const next = cfg.models.find(m => m.name === nextName);
-    cfg.defaultModel = { name: next.name, provider: next.provider };
-    saveConfig(cfg);
+    cycleDefaultModel();
     render();
     return true;
   }
 
-  // 调整数量
-  if (str === '-' || str === '_') {
-    cfg.workers = Math.max(1, cfg.workers - 1);
-    render(); return true;
-  }
-  if (str === '+' || str === '=') {
-    cfg.workers = Math.min(8, cfg.workers + 1);
-    render(); return true;
-  }
-  if (str === '[' || str === '{') {
-    cfg.verifyRounds = Math.max(1, cfg.verifyRounds - 1);
-    render(); return true;
-  }
-  if (str === ']' || str === '}') {
-    cfg.verifyRounds = Math.min(5, cfg.verifyRounds + 1);
-    render(); return true;
-  }
-
-  // 读取文件大小上限 (MB): < > 调整, 范围 1-500MB
-  if (str === '<' || str === ',') {
-    const mb = Math.max(1, Math.round(getMaxReadSize() / 1048576) - 5);
-    cfg.maxFileReadSize = mb * 1048576;
-    state.log(`▸ 读取文件大小上限: ${mb}MB`);
-    saveConfig(cfg);
-    render(); return true;
-  }
-  if (str === '>' || str === '.') {
-    const mb = Math.min(500, Math.round(getMaxReadSize() / 1048576) + 5);
-    cfg.maxFileReadSize = mb * 1048576;
-    state.log(`▸ 读取文件大小上限: ${mb}MB`);
-    saveConfig(cfg);
-    render(); return true;
-  }
-  // 单次读取字符上限: ; ' 调整 (2000 步进, 范围 2k-200k)
-  if (str === ';') {
-    cfg.maxFileReadChars = Math.max(2000, getMaxReadChars() - 2000);
-    state.log(`▸ 单次读取字符上限: ${cfg.maxFileReadChars}`);
-    saveConfig(cfg);
-    render(); return true;
-  }
-  if (str === "'") {
-    cfg.maxFileReadChars = Math.min(200000, getMaxReadChars() + 2000);
-    state.log(`▸ 单次读取字符上限: ${cfg.maxFileReadChars}`);
-    saveConfig(cfg);
-    render(); return true;
-  }
+  // (键盘数值调整键已移除 — 改为鼠标点击面板中的 < > 按钮)
 
   // tab 切换岗位
   if (key.name === 'tab') {
@@ -2837,30 +2736,93 @@ function handleSettingsKey(str, key) {
     return true;
   }
 
-  // m 更换模型 (循环可选模型, 即时写入配置)
+  // m 更换模型 (点击岗位行的键盘等价, 不再在面板中提示)
   if (str === 'm' || str === 'M') {
-    if (cfg.models.length === 0) {
-      state.log('◍ 暂无可用模型 — 先按 a 添加模型');
-      render();
-      return true;
-    }
-    const p = POSITIONS[state.settingsPos];
-    const names = cfg.models.map(m => m.name);
-    const cur = state.positions[p.key].model;
-    const idx = names.indexOf(cur);
-    // 当前岗位模型不在列表中时 (显示 '-') 从第一个开始
-    const next = names[(idx + 1) % names.length] || names[0];
-    state.positions[p.key].model = next;
-    // 同步写配置并持久化
-    const entry = cfg.models.find(m => m.name === next);
-    cfg.positions[p.key] = { name: entry.name, provider: entry.provider, baseUrl: entry.baseUrl, modelId: entry.modelId };
-    saveConfig(cfg);
-    state.log(`▸ ${p.label} 模型已设为: ${next}`);
+    cyclePositionModel(state.settingsPos);
     render();
     return true;
   }
 
   return false;
+}
+
+// ---------- 设置面板鼠标按钮动作 ----------
+function cycleDefaultModel() {
+  const cfg = state.config;
+  if (!cfg.models || cfg.models.length === 0) {
+    state.log('◍ 暂无可用模型 — 点击 [+ 添加模型] 先添加');
+    return;
+  }
+  const names = cfg.models.map(m => m.name);
+  const cur = cfg.defaultModel?.name;
+  const idx = names.indexOf(cur);
+  const nextName = names[(idx + 1) % names.length];
+  const next = cfg.models.find(m => m.name === nextName);
+  cfg.defaultModel = { name: next.name, provider: next.provider };
+  saveConfig(cfg);
+}
+
+function cyclePositionModel(posIdx) {
+  const cfg = state.config;
+  if (!cfg.models || cfg.models.length === 0) {
+    state.log('◍ 暂无可用模型 — 点击 [+ 添加模型] 先添加');
+    return;
+  }
+  const p = POSITIONS[posIdx];
+  const names = cfg.models.map(m => m.name);
+  const cur = state.positions[p.key].model;
+  const idx = names.indexOf(cur);
+  // 当前岗位模型不在列表中时 (显示 '-') 从第一个开始
+  const next = names[(idx + 1) % names.length] || names[0];
+  state.positions[p.key].model = next;
+  // 同步写配置并持久化
+  const entry = cfg.models.find(m => m.name === next);
+  cfg.positions[p.key] = { name: entry.name, provider: entry.provider, baseUrl: entry.baseUrl, modelId: entry.modelId };
+  saveConfig(cfg);
+  state.log(`▸ ${p.label} 模型已设为: ${next}`);
+}
+
+function handleSettingsButton(action, arg) {
+  const cfg = state.config;
+  switch (action) {
+    case 'workers-': cfg.workers = Math.max(1, cfg.workers - 1); break;
+    case 'workers+': cfg.workers = Math.min(8, cfg.workers + 1); break;
+    case 'verify-': cfg.verifyRounds = Math.max(1, cfg.verifyRounds - 1); break;
+    case 'verify+': cfg.verifyRounds = Math.min(5, cfg.verifyRounds + 1); break;
+    case 'size-':
+    case 'size+': {
+      const mb = Math.min(500, Math.max(1, Math.round(getMaxReadSize() / 1048576) + (action === 'size+' ? 5 : -5)));
+      cfg.maxFileReadSize = mb * 1048576;
+      state.log(`▸ 读取文件大小上限: ${mb}MB`);
+      break;
+    }
+    case 'chars-':
+    case 'chars+': {
+      cfg.maxFileReadChars = action === 'chars+'
+        ? Math.min(200000, getMaxReadChars() + 2000)
+        : Math.max(2000, getMaxReadChars() - 2000);
+      state.log(`▸ 单次读取字符上限: ${cfg.maxFileReadChars}`);
+      break;
+    }
+    case 'defaultModel':
+      cycleDefaultModel();
+      break;
+    case 'position':
+      // 第一次点 = 选中岗位; 再点同一岗位 = 循环换模型
+      if (state.settingsPos === arg) {
+        cyclePositionModel(arg);
+      } else {
+        state.settingsPos = arg;
+      }
+      break;
+    case 'addModel':
+      state.settingsScroll = 0;
+      startAddModel();
+      return; // startAddModel 内部已 render
+    default:
+      return;
+  }
+  render();
 }
 
 // ---------- 自定义输入解析 (避免 readline 拆碎鼠标序列泄漏到输入框) ----------
@@ -2901,25 +2863,12 @@ function parseInput() {
         } else if (btn >= 64 && btn <= 67 && mouse[4] === 'M') {
           // 滚轮事件: 64=up, 65=down, 66=left, 67=right
           const wheelUp = btn === 64 || btn === 66;
-          // ① 设置面板内 → 设置面板滚动 (最高优先, 面板是覆盖层)
-          if (state.settingsOpen && !state.addStep) {
-            const pw = 52, ph = 19;
-            const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
-            const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
-            if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
-              const delta = wheelUp ? -1 : 1;
-              const max = Math.max(0, 17 - (state.terminalHeight - 20));
-              state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
-              render();
-            }
-          } else if (state.settingsOpen && state.addStep) {
-            // 添加模型流程中也允许滚动
-            const pw = 52, ph = 26;
-            const px = Math.max(4, Math.floor((state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) * 0.5) - Math.floor(pw / 2));
-            const py = Math.max(1, Math.floor((state.terminalHeight - ph) / 2));
-            if (col >= px && col <= px + pw && row >= py && row <= py + ph) {
-              const delta = wheelUp ? -1 : 1;
-              const max = Math.max(0, 24 - (state.terminalHeight - 20));
+          // ① 设置面板内 → 设置面板滚动 (最高优先, 面板是覆盖层; 几何由 renderSettingsPanel 记录)
+          if (state.settingsOpen) {
+            const g = state._settingsGeom;
+            if (g && col >= g.px && col <= g.px + g.pw && row >= g.py && row <= g.py + g.ph) {
+              const delta = wheelUp ? -2 : 2;
+              const max = state._settingsMaxScroll || 0;
               state.settingsScroll = Math.max(0, Math.min(max, state.settingsScroll + delta));
               render();
             }
@@ -3203,6 +3152,7 @@ async function handleKey(str, key) {
     if (state.settingsOpen) {
       state.settingsPos = 0;
       state.addStep = null;
+      state.settingsScroll = 0;
     }
     render();
     return;
@@ -3426,6 +3376,12 @@ module.exports = {
     getMaxReadSize,
     getMaxReadChars,
     handleKey: (str, key) => handleKey(str, key),
-    handleKeyPublic: (str, key) => handleKey(str, key)
+    handleKeyPublic: (str, key) => handleKey(str, key),
+    renderSettingsPanel: () => renderSettingsPanel(),
+    handleSettingsKey: (str, key) => handleSettingsKey(str, key),
+    handleSettingsButton: (action, arg) => handleSettingsButton(action, arg),
+    handleMouseClick: (col, row) => handleMouseClick(col, row),
+    cycleDefaultModel: () => cycleDefaultModel(),
+    cyclePositionModel: (idx) => cyclePositionModel(idx)
   }
 };
