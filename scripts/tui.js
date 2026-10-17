@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.13',
+  version: '0.2.14',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -202,6 +202,7 @@ class TUIState {
     this.treeScroll = 0;     // 工作树纵向滚动偏移 (内容超高时)
     this.treeCollapsed = {}; // 工作树折叠状态: {positionKey: true} 收起其子分支
     this._treeFocusToken = null; // 上次自动跟随的焦点 (选中/执行目标@终端尺寸), 变化才跟随
+    this._subRoHintAt = 0;       // 只读子窗口提示的节流时间戳
     // 添加模型五步流程: provider → baseUrl → apiKey → modelId → displayName → afterAdd
     this.addStep = null;
     this.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
@@ -225,8 +226,12 @@ class TUIState {
     // 每会话独立工作区 (从默认工作区继承)
     this.workspaceDir = this.config.defaultWorkspaceDir || this.config.workspaceDir || homePath;
 
+    // 每个岗位的子会话存储 (全局, 跨标签共享): { [posKey]: { log: [], updatedAt } }
+    this.subSessions = {};
+
     // 多会话 (浏览器式标签): sessions 保存各会话快照, activeIndex 为当前
-    this.sessions = [{ id: crypto.randomUUID().slice(0, 8), title: '会话 1', snapshot: null }];
+    // kind: 'main' 主会话 | 'sub' 岗位子会话窗口 (只读); posKey 仅 sub 用
+    this.sessions = [{ id: crypto.randomUUID().slice(0, 8), title: '会话 1', kind: 'main', posKey: null, snapshot: null }];
     this.activeIndex = 0;
     this._tabsGeom = null;        // 标签栏几何信息 (鼠标点击用)
 
@@ -410,7 +415,7 @@ function newSession() {
   serializeSession(state.activeIndex);
   applyFreshSession();
   const title = `会话 ${state.sessions.length + 1}`;
-  state.sessions.push({ id: crypto.randomUUID().slice(0, 8), title, snapshot: null });
+  state.sessions.push({ id: crypto.randomUUID().slice(0, 8), title, kind: 'main', posKey: null, snapshot: null });
   state.activeIndex = state.sessions.length - 1;
   state.log(`▸ 新建${title} · 工作区: ${state.workspaceDir}`);
   render();
@@ -1104,7 +1109,7 @@ function render() {
   } else if (state.history.length === 0) {
     write(2, historyTop, '欢迎使用 ORcode 终端模式。', c.text);
     write(2, historyTop + 1, '直接输入文字 = 单模型调用 (初始模型对话) · /hor-loop = 多模型工作流。', c.text);
-    write(2, historyTop + 2, '/ 查看命令 · tab 切换岗位 · 空输入回车进子会话 · 点击 ⚙ 设置。', c.text);
+    write(2, historyTop + 2, '/ 查看命令 · tab 切换岗位 · 空输入回车打开该岗位子会话窗口 (只读) · 点击 ⚙ 设置。', c.text);
     write(2, historyTop + 3, '对话历史可翻看: 滚轮 / PgUp / PgDn · 每轮对话之间有分割线。', c.faint);
   } else {
     const historyBottom = H - 4;
@@ -1275,7 +1280,7 @@ function render() {
   else if (state.addStep === 'modelId') placeholder = '步骤 4/5 · 输入模型 ID (如 deepseek-chat / qwen-max)';
   else if (state.addStep === 'displayName') placeholder = '步骤 5/5 · 输入显示名称 (如 DeepSeek V3)';
   else if (state.addStep === 'afterAdd') placeholder = '回车 = 继续添加同一供应商模型 · 空格 = 添加其他供应商模型 · s = 完成添加';
-  else if (state.subSession) placeholder = `子会话 · ${POSITIONS.find(p => p.key === state.subSession)?.label || ''} — 直接输入用该岗位模型执行 · Esc 返回`;
+  else if (state.subSession) placeholder = `子会话窗口 · ${POSITIONS.find(p => p.key === state.subSession)?.label || ''} — 🔒 只读, 不可与子模型对话 · Esc 返回`;
   else if (state.modelsOpen) placeholder = '模型选择中 · ↑↓/鼠标悬停选择 · 输入字符过滤 · enter 确认 · esc 关闭';
   else if (state.questionnaire) placeholder = '问卷回答中 · ↑↓ 切换 · 空格 勾选/选择 · enter 提交 · esc 跳过';
   else if (state.permissionRequest) placeholder = '权限申请中 · Y 同意并记住 · E 仅本次授权 · N/Esc 拒绝';
@@ -1286,7 +1291,7 @@ function render() {
   if (state.currentInput || !placeholder) {
     write(2, inputY, `${prompt}${state.currentInput}`, c.text);
   } else {
-    write(2, inputY, truncateAnsi(`${prompt}${placeholder}`, Math.max(10, divX - 3)), (state.waitingForTask || state.subSession) ? c.accent : c.faint);
+    write(2, inputY, truncateAnsi(`${prompt}${placeholder}`, Math.max(10, divX - 3)), state.waitingForTask ? c.accent : c.faint);
   }
   // 重新定位光标到正确位置 (光标可能在中间) — 先夹紧防越界
   clampCursor();
@@ -1343,7 +1348,9 @@ function renderTabBar() {
       ? state.workspaceDir
       : (t.snapshot ? t.snapshot.workspaceDir : (state.config.defaultWorkspaceDir || state.config.workspaceDir));
     const wsBase = (wsd ? path.basename(wsd) : '~');
-    const label = `${i + 1}.${t.title} · ${wsBase}`;
+    const label = t.kind === 'sub'
+      ? `${i + 1}.${t.title} · 子会话`
+      : `${i + 1}.${t.title} · ${wsBase}`;
     const disp = `${active ? '▸' : ' '}${label}${active ? ' ' : '  '}`;
     moveCursor(x, y);
     if (active) process.stdout.write(`${c.reverse}${c.text}${disp}${c.reset}`);
@@ -1395,23 +1402,42 @@ function renderInitOverlay() {
   });
 }
 
-// ---------- 岗位子会话视图 ----------
+// ---------- 岗位子会话窗口 (只读视图) ----------
 function renderSubSession(mainW, H) {
   const key = state.subSession;
   const pos = state.positions[key];
   if (!pos) return;
 
   // 标题栏
-  write(2, 11, `◈ 子会话 · ${pos.label}  ${c.sub}(${pos.model})${c.reset}`, c.accent);
+  write(2, 11, `◈ 子会话窗口 · ${pos.label}  ${c.sub}(${pos.model})${c.reset}  ${c.yellow}🔒 只读${c.reset}`, c.accent);
   write(2, 12, `${c.faint}${'─'.repeat(mainW - 6)}${c.reset}`, c.faint);
 
   let ry = 14;
 
-  // ---- 思考过程 ----
-  write(2, ry, `${c.sub}▸ 思考过程 (Thought)${c.reset}`, c.sub);
+  // ---- 该模型的子会话记录 (来自 HOR-loop / 单模型调用) ----
+  write(2, ry, `${c.sub}▸ 子会话记录 (${state.subSessionLog.length} 条)${c.reset}`, c.sub);
+  ry++;
+  if (state.subSessionLog.length === 0) {
+    write(4, ry, `${c.faint}(暂无记录 — 该模型参与 /hor-loop 或被单模型调用后, 记录会出现在这里)${c.reset}`, c.faint);
+    ry++;
+  } else {
+    const maxRows = Math.max(3, H - 14 - ry - 8);
+    state.subSessionLog.slice(-maxRows).forEach(l => {
+      let color = c.text;
+      if (l.includes('✓')) color = c.green;
+      if (l.includes('✗') || l.includes('错误')) color = c.red;
+      if (l.startsWith('◆') || l.startsWith('▸ 你:')) color = c.accent;
+      write(4, ry, truncateAnsi(l, mainW - 8), color);
+      ry++;
+    });
+  }
+  ry++;
+
+  // ---- 最近思考 ----
+  write(2, ry, `${c.sub}▸ 最近思考${c.reset}`, c.sub);
   ry++;
   if (pos.thought.length === 0) {
-    write(4, ry, `${c.faint}(暂无思考记录 — 运行 /hor-loop 后在此显示)${c.reset}`, c.faint);
+    write(4, ry, `${c.faint}(暂无)${c.reset}`, c.faint);
     ry++;
   } else {
     pos.thought.forEach((t, i) => {
@@ -1419,108 +1445,104 @@ function renderSubSession(mainW, H) {
       ry++;
     });
   }
-  ry++;
-
-  // ---- 主会话中该岗位的执行记录 ----
-  write(2, ry, `${c.sub}▸ 执行记录 (来自主会话)${c.reset}`, c.sub);
-  ry++;
-  const labelWord = pos.label.split(' ')[1] || pos.label; // 如 Planner
-  const related = state.history.filter(l => l.includes(labelWord));
-  if (related.length === 0) {
-    write(4, ry, `${c.faint}(暂无执行记录)${c.reset}`, c.faint);
-    ry++;
-  } else {
-    const maxRows = Math.max(3, H - 14 - ry - 6);
-    const show = related.slice(-maxRows);
-    show.forEach(l => {
-      let color = c.text;
-      if (l.includes('✓')) color = c.green;
-      if (l.includes('○')) color = c.yellow;
-      if (l.includes('●')) color = c.accent;
-      write(4, ry, truncateAnsi(l, mainW - 8), color);
-      ry++;
-    });
-  }
-
-  // ---- 子会话对话记录 ----
-  if (state.subSessionLog.length > 0) {
-    ry++;
-    write(2, ry, `${c.sub}▸ 子会话指令记录${c.reset}`, c.sub);
-    ry++;
-    state.subSessionLog.slice(-6).forEach(l => {
-      write(4, ry, truncateAnsi(l, mainW - 8), l.startsWith('▸') ? c.accent : c.text);
-      ry++;
-    });
-  }
 
   // ---- 底部提示 ----
-  write(2, H - 4, `${c.faint}直接输入 = 用该岗位模型单独执行 · Esc = 返回主会话${c.reset}`, c.faint);
+  write(2, H - 4, `${c.yellow}🔒 只读窗口 — 不可与子模型对话${c.reset}${c.faint} · Esc 返回主会话${c.reset}`, c.faint);
 }
 
-// 进入岗位子会话
-function enterSubSession(key) {
+// ============ 岗位子会话窗口 (只读) ============
+// 每个岗位一个子会话: 点击工作树岗位行 → 在新标签页打开, 只读查看该模型的活动记录, 不可对话
+
+// 取 (惰性创建) 某岗位的子会话存储
+function getSubSession(key) {
+  if (!state.subSessions[key]) state.subSessions[key] = { log: [], updatedAt: Date.now() };
+  return state.subSessions[key];
+}
+
+// 追加一条子会话记录 (HOR-loop / 单模型调用中该岗位的活动)
+function subLog(key, text) {
+  const sub = getSubSession(key);
+  sub.log.push(text);
+  if (sub.log.length > 300) sub.log.splice(0, sub.log.length - 300);
+  sub.updatedAt = Date.now();
+  // 若该岗位的子会话窗口正开着 → 同步显示副本
+  const cur = state.sessions[state.activeIndex];
+  if (cur && cur.kind === 'sub' && cur.posKey === key) state.subSessionLog = sub.log.slice();
+}
+
+// 模型名 → 岗位 key (单模型调用归档到对应模型的子会话), 找不到回退 director
+function subKeyForModel(name) {
+  const p = POSITIONS.find(pp => state.positions[pp.key] && state.positions[pp.key].model === name);
+  return p ? p.key : 'director';
+}
+
+// 切换到子会话窗口视图 (只读)
+function applySubSessionView(key) {
+  const sub = getSubSession(key);
+  state.history = [];
+  setInput('');
+  state.cursorPosition = 0;
+  const idx = POSITIONS.findIndex(p => p.key === key);
+  state.selectedIndex = idx >= 0 ? idx : 0;
   state.subSession = key;
-  state.subSessionLog = [];
-  setInput('');
-  state.waitingForTask = false;
-  state.log(`▸ 进入子会话: ${POSITIONS.find(p => p.key === key)?.label || key}`);
-  render();
-}
-
-// 退出子会话
-function exitSubSession() {
-  const key = state.subSession;
-  state.subSession = null;
-  state.subSessionLog = [];
-  setInput('');
-  if (key) state.log(`◂ 退出子会话: ${POSITIONS.find(p => p.key === key)?.label || key}`);
-  render();
-}
-
-// 子会话内单独调用该岗位模型
-async function runSubSessionCall(instruction) {
-  const key = state.subSession;
-  const pos = state.positions[key];
-  if (!pos) return;
-
-  state.running = true;
-  state.activePos = key;
-  state.subSessionLog.push(`▸ 指令: ${instruction}`);
-  state.subSessionLog.push('  ▸ 思考中...');
-  render();
-
-  const cfg = state.config;
-  const modelEntry = (cfg.models.find(m => m.name === pos.model)) || null;
-
-  // 数据库: 子会话记录
-  const sid = crypto.randomUUID();
-  dbManager.createSession(sid, `[子会话·${pos.label}] ${instruction}`, { [key]: modelEntry || { name: '-', provider: '-' } });
-
-  let result;
-  if (!modelEntry) {
-    result = '[未配置] 该岗位没有分配模型 — 请在设置中按 m 分配';
-  } else {
-    const singleCfg = Object.assign({}, cfg, {
-      positions: { [key]: modelEntry }
-    });
-    try {
-      result = await runModelWithQuestionnaire(key, instruction, singleCfg, buildModelContext(instruction));
-    } catch (e) {
-      result = `[错误] ${e.message}`;
-    }
-  }
-
-  dbManager.logMessage(sid, key, `指令: ${instruction}`, 'info');
-  dbManager.logMessage(sid, key, `响应: ${String(result).substring(0, 200)}`, result.startsWith('[') ? 'error' : 'success');
-  dbManager.updateSessionStatus(sid, 'completed');
-
-  state.subSessionLog.push(`  ▸ 响应:`);
-  String(result).split('\n').forEach(line => {
-    state.subSessionLog.push(`  ${line}`);
-  });
-  state.tokens += 32;
-  state.activePos = null;
+  state.subSessionLog = sub.log.slice();
   state.running = false;
+  state.activePos = null;
+  state.sessionId = null;
+  state.tokens = 0;
+  state.waitingForTask = false;
+  state.historyScroll = 0;
+  state.treeScroll = 0;
+  // 岗位状态: 全新一份; "最近思考"用该岗位子会话记录尾部填充
+  const positions = {};
+  POSITIONS.forEach(p => {
+    positions[p.key] = {
+      ...p,
+      status: 'idle',
+      model: state.config.positions[p.key]?.name || '-',
+      thought: [],
+      output: null
+    };
+  });
+  positions[key].thought = sub.log.slice(-3);
+  state.positions = positions;
+}
+
+// 打开 (或聚焦) 某岗位的子会话窗口 — 新标签页, 只读
+function openSubSessionTab(key) {
+  if (state.running || state.questionnaire) return;
+  const exist = state.sessions.findIndex(s => s.kind === 'sub' && s.posKey === key);
+  if (exist >= 0) {
+    switchSession(exist);
+    // 从存储刷新显示 (离开期间可能有新活动)
+    const sub = getSubSession(key);
+    state.subSessionLog = sub.log.slice();
+    if (state.positions[key]) state.positions[key].thought = sub.log.slice(-3);
+    render();
+    return;
+  }
+  serializeSession(state.activeIndex);
+  const pos = POSITIONS.find(p => p.key === key);
+  state.sessions.push({
+    id: crypto.randomUUID().slice(0, 8),
+    title: pos ? pos.label : key,
+    kind: 'sub', posKey: key, snapshot: null
+  });
+  state.activeIndex = state.sessions.length - 1;
+  applySubSessionView(key);
+  state.log(`▸ 打开子会话窗口: ${pos ? pos.label : key}`, c.accent);
+  state.log('🔒 只读窗口 — 不可与子模型对话 · Esc 返回主会话', c.yellow);
+  render();
+}
+
+// 从子会话窗口返回主会话标签 (没有主标签则把当前标签转正)
+function returnToMainTab() {
+  const mainIdx = state.sessions.findIndex(s => s.kind === 'main');
+  if (mainIdx >= 0) { switchSession(mainIdx); return; }
+  const cur = state.sessions[state.activeIndex];
+  if (cur) { cur.kind = 'main'; cur.posKey = null; }
+  applyFreshSession();
+  state.log('▸ 子会话窗口已转为主会话');
   render();
 }
 
@@ -2321,6 +2343,7 @@ async function runHorLoop(instruction) {
   dbManager.createSession(state.sessionId, `[HOR-loop] ${instruction}`, state.config.positions);
 
   state.log(`◆ 任务: ${instruction}`);
+  subLog('director', `◆ 接收任务: ${instruction}`);
   render();
 
   // Director
@@ -2328,6 +2351,7 @@ async function runHorLoop(instruction) {
   state.updatePosition('director', { status: 'thinking' });
   state.addThought('director', '接收指令，准备协调');
   state.log(`○ 指挥 Director · 思考中`);
+  subLog('director', '○ 思考中…');
   dbManager.logMessage(state.sessionId, 'director', '接收指令', 'info');
   await sleep(700); render();
 
@@ -2336,14 +2360,17 @@ async function runHorLoop(instruction) {
   state.updatePosition('planner', { status: 'thinking' });
   state.addThought('planner', '分析任务需求');
   state.log(`○ 规划 Planner · 分析任务需求`);
+  subLog('planner', '○ 分析任务需求');
   dbManager.logMessage(state.sessionId, 'planner', '分析任务需求', 'info');
   await sleep(600); render();
   state.addThought('planner', '制定执行步骤');
   state.log(`○ 规划 Planner · 制定执行步骤`);
+  subLog('planner', '○ 制定执行步骤');
   dbManager.logMessage(state.sessionId, 'planner', '制定执行步骤', 'info');
   await sleep(600); render();
   state.updatePosition('planner', { status: 'completed' });
   state.log(`✓ 规划 Planner · 计划完成`);
+  subLog('planner', '✓ 计划完成');
   dbManager.logMessage(state.sessionId, 'planner', '计划完成', 'success');
   await sleep(300); render();
 
@@ -2353,11 +2380,13 @@ async function runHorLoop(instruction) {
   for (let i = 1; i <= state.config.workers; i++) {
     state.addThought('worker', `Worker ${i} 执行中`);
     state.log(`● 执行 Workers · Worker ${i} 并发执行`);
+    subLog('worker', `● Worker ${i} 执行中`);
     dbManager.logMessage(state.sessionId, 'worker', `Worker ${i} 执行`, 'info');
     await sleep(500); render();
   }
   state.updatePosition('worker', { status: 'completed' });
   state.log(`✓ 执行 Workers · ${state.config.workers} 个并发完成`);
+  subLog('worker', `✓ ${state.config.workers} 个并发完成`);
   await sleep(300); render();
 
   // Verifier
@@ -2366,9 +2395,11 @@ async function runHorLoop(instruction) {
   for (let r = 1; r <= state.config.verifyRounds; r++) {
     state.addThought('verifier', `第 ${r} 轮核查`);
     state.log(`○ 检验 Verifier · 第 ${r} 轮核查`);
+    subLog('verifier', `○ 第 ${r} 轮核查`);
     dbManager.logMessage(state.sessionId, 'verifier', `第 ${r} 轮核查`, 'info');
     await sleep(600); render();
     state.log(`✓ 检验 Verifier · 第 ${r} 轮通过`);
+    subLog('verifier', `✓ 第 ${r} 轮通过`);
     dbManager.logMessage(state.sessionId, 'verifier', `第 ${r} 轮通过`, 'success');
   }
   state.updatePosition('verifier', { status: 'completed' });
@@ -2379,6 +2410,7 @@ async function runHorLoop(instruction) {
   state.updatePosition('director', { status: 'working' });
   state.addThought('director', '整合所有结果');
   state.log(`○ 指挥 Director · 整合输出`);
+  subLog('director', '○ 整合输出');
   dbManager.logMessage(state.sessionId, 'director', '整合输出', 'info');
   await sleep(500); render();
 
@@ -2387,6 +2419,7 @@ async function runHorLoop(instruction) {
   state.tokens += 128;
   dbManager.logMessage(state.sessionId, 'director', '任务完成', 'success');
   dbManager.updateSessionStatus(state.sessionId, 'completed');
+  subLog('director', '✓ 任务完成');
   state.log('');
   // 最终输出: 荧光粉高亮
   state.log(`━━━ OUTPUT ━━━`, c.pinkBright);
@@ -2418,6 +2451,9 @@ async function runSingleModel(instruction) {
   dbManager.createSession(sid, `[单模型] ${instruction}`, { director: modelEntry });
 
   state.log(`◆ 单模型调用 · ${modelEntry.name}`);
+  const subKey = subKeyForModel(modelEntry.name);
+  subLog(subKey, `◆ 单模型调用 · ${modelEntry.name}`);
+  subLog(subKey, `▸ 你: ${instruction}`);
   state.log('  ▸ 思考中...');
   state.activePos = 'director';
   state.updatePosition('director', { status: 'thinking' });
@@ -2445,8 +2481,10 @@ async function runSingleModel(instruction) {
   state.activePos = null;
   state.addThought('director', '响应完成');
   state.log('  ▸ 响应:');
+  subLog(subKey, '  ▸ 响应:');
   String(result).split('\n').forEach(line => {
     state.log(`  ${line}`, c.pinkBright);
+    subLog(subKey, `  ${line}`);
   });
   state.tokens += 64;
   state.running = false;
@@ -3017,7 +3055,7 @@ function handleMouseClick(col, row) {
     return;
   }
 
-  // 点击工作树岗位行 → 选中; director 保持主会话, 其他进入子会话; 点行尾 ▸/▾ 折叠或展开子分支
+  // 点击工作树岗位行 → 在新标签页打开该岗位的子会话窗口 (只读); 点行尾 ▸/▾ 折叠或展开子分支
   const tg = state._treeGeom;
   if (tg && col >= tg.x) {
     const hit = tg.rows.find(r => r.y === row);
@@ -3029,12 +3067,7 @@ function handleMouseClick(col, row) {
       }
       const idx = POSITIONS.findIndex(p => p.key === hit.key);
       if (idx >= 0) state.selectedIndex = idx;
-      if (hit.key === 'director') {
-        state.log('▸ Director 为主会话 — 其他岗位可点击进入子会话');
-        render();
-      } else {
-        enterSubSession(hit.key);
-      }
+      openSubSessionTab(hit.key);
       return;
     }
   }
@@ -3370,35 +3403,22 @@ async function handleKey(str, key) {
     return;
   }
 
-  // ---- 岗位子会话模式 (次最高优先级) ----
+  // ---- 岗位子会话窗口 (只读, 次最高优先级) ----
   if (state.subSession && !state.running) {
-    // Esc 返回主会话
+    // Esc 返回主会话标签
     if (key.name === 'escape') {
-      exitSubSession();
+      returnToMainTab();
       return;
     }
-    // 回车: 用该岗位模型执行输入
-    if (key.name === 'return' || key.name === 'enter') {
-      const input = state.currentInput.trim();
-      if (input) {
-        setInput('');
-        logUserTurn(input);           // 分割线 + 用户输入入历史
-        await runSubSessionCall(input);
+    // 只读: 输入/回车一律不放行, 仅间隔提示
+    if (key.name === 'return' || key.name === 'enter' || (str && !key.ctrl && !key.meta)) {
+      const now = Date.now();
+      if (!state._subRoHintAt || now - state._subRoHintAt > 1500) {
+        state._subRoHintAt = now;
+        state.log('◍ 子模型会话为只读窗口 — 不可与子模型对话 (Esc 返回主会话)', c.yellow);
+        render();
       }
       return;
-    }
-    // 退格
-    if (key.name === 'backspace') {
-      state.currentInput = state.currentInput.slice(0, -1);
-      state.cursorPosition = state.currentInput.length;   // 追加型模式: 光标保持末端
-      render();
-      return;
-    }
-    // 普通字符输入
-    if (str && !key.ctrl && !key.meta) {
-      state.currentInput += str;
-      state.cursorPosition = state.currentInput.length;   // 追加型模式: 光标保持末端
-      render();
     }
     return;
   }
@@ -3592,14 +3612,11 @@ async function handleKey(str, key) {
       }
     }
 
-    // 空输入 + 选中非 director 岗位 → 进入该岗位子会话
+    // 空输入 + 选中某岗位 → 在新标签页打开该岗位的子会话窗口 (只读)
     if (!input && !state.running) {
       const p = POSITIONS[state.selectedIndex];
-      if (p && p.key !== 'director') {
-        enterSubSession(p.key);
-      } else if (p && p.key === 'director') {
-        state.log('▸ Director 为主会话 — tab 切换到其他岗位后回车可进入子会话');
-        render();
+      if (p) {
+        openSubSessionTab(p.key);
       }
       return;
     }
@@ -3771,6 +3788,12 @@ module.exports = {
     cycleDefaultModel: () => cycleDefaultModel(),
     cyclePositionModel: (idx) => cyclePositionModel(idx),
     POSITIONS, POSITION_TREE, TOP_POSITION_KEYS,
+    openSubSessionTab: (key) => openSubSessionTab(key),
+    returnToMainTab: () => returnToMainTab(),
+    getSubSession: (key) => getSubSession(key),
+    subLog: (key, text) => subLog(key, text),
+    subKeyForModel: (name) => subKeyForModel(name),
+    applySubSessionView: (key) => applySubSessionView(key),
     closeSession: (idx) => closeSession(idx)
   }
 };

@@ -169,23 +169,27 @@ function toGrid(W, H) {
   tui.__test.render();
   const coderRow = state._treeGeom.rows.find(r => r.key === 'coder');
   tui.__test.handleMouseClick(coderRow ? state._treeGeom.x + 6 : 0, coderRow.y);
-  check('点击子岗行 (程序员) 进入子会话', state.subSession === 'coder');
+  check('点击子岗行 (程序员) 打开子会话窗口', state.subSession === 'coder');
+  check('子会话窗口是新标签页 (kind=sub)', state.sessions[state.activeIndex].kind === 'sub' && state.sessions[state.activeIndex].posKey === 'coder');
+  check('标签标题含岗位名', state.sessions[state.activeIndex].title.includes('Coder'));
 
-  // director 行点击只选中不进子会话
+  // director 行点击也打开子会话窗口 (每个模型都有)
+  tui.__test.returnToMainTab();
   state.subSession = null;
   tui.__test.render();
   const dirRow = state._treeGeom.rows.find(r => r.key === 'director');
   tui.__test.handleMouseClick(dirRow ? state._treeGeom.x + 6 : 0, dirRow.y);
-  check('点击 Director 保持主会话 (不进子会话)', state.subSession === null);
+  check('点击 Director 也打开子会话窗口', state.subSession === 'director' && state.sessions[state.activeIndex].kind === 'sub');
   check('点击 Director 同步 selectedIndex', POSITIONS[state.selectedIndex].key === 'director');
 
   // 点岗位行 (非折叠标记) 不会误触折叠
   state.treeCollapsed = {};
+  tui.__test.returnToMainTab();
   tui.__test.render();
   const plannerRow = state._treeGeom.rows.find(r => r.key === 'planner');
   tui.__test.handleMouseClick(state._treeGeom.x + 8, plannerRow.y);
   check('点行主体不触发折叠', state.treeCollapsed.planner !== true);
-  check('点 Planner 行进子会话', state.subSession === 'planner');
+  check('点 Planner 行打开子会话窗口', state.subSession === 'planner' && state.sessions[state.activeIndex].kind === 'sub');
 
   // ==================== 汇总 ====================
   const pass = results.filter(r => r[1]).length;
