@@ -93,7 +93,25 @@ const K = (name, extra = {}) => Object.assign({ name, ctrl: false, meta: false }
   check('HOR-loop 后 planner 子会话有记录', tui.__test.getSubSession('planner').log.some(l => l.includes('计划完成')));
   check('HOR-loop 后 worker 子会话有记录', tui.__test.getSubSession('worker').log.some(l => l.includes('Worker 1')));
   check('HOR-loop 后 verifier 子会话有记录', tui.__test.getSubSession('verifier').log.some(l => l.includes('第 1 轮')));
-  check('职能岗 (coder) 无 HOR 活动 → 记录为空', tui.__test.getSubSession('coder').log.length === 2);
+  // 子智能体: director/planner 子岗顺序执行, worker 子岗并行执行 — 全部完成并入各自子会话
+  const dirKids = tui.__test.childKeys('director');
+  const planKids = tui.__test.childKeys('planner');
+  const workKids = tui.__test.childKeys('worker');
+  check('director 子智能体全部完成', dirKids.every(k => state.positions[k].status === 'completed'));
+  check('planner 子智能体全部完成 (含美术指导)', planKids.every(k => state.positions[k].status === 'completed') && state.positions['art-director'].status === 'completed');
+  check('worker 11 个子智能体全部完成 (含视觉双岗)', workKids.length === 11 && workKids.every(k => state.positions[k].status === 'completed'));
+  check('美术指导活动入其子会话', tui.__test.getSubSession('art-director').log.some(l => l.includes('视觉风格')));
+  check('视觉设计师活动入其子会话', tui.__test.getSubSession('visual-designer').log.some(l => l.includes('✓ 完成')));
+  check('图像分析师活动入其子会话', tui.__test.getSubSession('vision-analyst').log.some(l => l.includes('✓ 完成')));
+  check('程序员子会话有 HOR 活动 (不再是空的)', tui.__test.getSubSession('coder').log.some(l => l.includes('✓ 完成')));
+
+  // ==================== 5. 并行验证: worker 子智能体并行耗时 < 顺序耗时 ====================
+  // 重新跑一轮只测 worker 阶段: 11 个子智能体, 若串行需 ~ (300+500+..+1600)ms, 并行应 < 2000ms
+  Object.keys(state.positions).forEach(k => { state.positions[k].status = 'idle'; });
+  const t0 = Date.now();
+  await Promise.all(workKids.map((k, i) => tui.__test.runSubAgent(k, 50, 100 + i * 50)));
+  const parallelMs = Date.now() - t0;
+  check('worker 子智能体并行执行 (耗时 << 串行)', parallelMs < 1500 && workKids.every(k => state.positions[k].status === 'completed'));
 
   // ==================== 5. 标签栏渲染 ====================
   out = '';
@@ -107,7 +125,7 @@ const K = (name, extra = {}) => Object.assign({ name, ctrl: false, meta: false }
   const before = state.sessions.length;
   tui.__test.closeSession(state.activeIndex);
   check('关闭子标签成功', state.sessions.length === before - 1 && !state.sessions.some(s => s.posKey === 'tester'));
-  check('关闭后记录仍保留在存储', tui.__test.getSubSession('coder').log.length === 2);
+  check('关闭后记录仍保留在存储', tui.__test.getSubSession('coder').log.length >= 2);
 
   // ==================== 7. subKeyForModel 路由 ====================
   state.positions.coder.model = 'm2';

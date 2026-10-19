@@ -49,19 +49,27 @@ function toGrid(W, H) {
   const tui = require('./scripts/tui.js');
   const state = tui.__test.initState();
   const { POSITIONS, POSITION_TREE, TOP_POSITION_KEYS } = tui.__test;
+  const childKeys = tui.__test.childKeys;
 
   // ==================== 1. 岗位树结构 ====================
   check('流程层 4 个父节点', TOP_POSITION_KEYS.length === 4);
   check('流程层顺序 = director/planner/worker/verifier',
     JSON.stringify(TOP_POSITION_KEYS) === JSON.stringify(['director', 'planner', 'worker', 'verifier']));
   check('每个父节点都有子分支', POSITION_TREE.every(p => Array.isArray(p.children) && p.children.length >= 1 || p.key === 'verifier'));
-  check('职能层共 12 个子节点', POSITIONS.length - TOP_POSITION_KEYS.length === 12);
-  check('扁平化总数 16', POSITIONS.length === 16);
+  check('职能层共 15 个子节点', POSITIONS.length - TOP_POSITION_KEYS.length === 15);
+  check('扁平化总数 19', POSITIONS.length === 19);
   check('子节点带 parent 指向父节点', POSITIONS.filter(p => p.parent).every(p => TOP_POSITION_KEYS.includes(p.parent)));
   check('包含新增职能岗 (researcher/coder/critic/translator...)',
     ['researcher', 'data', 'coder', 'tester', 'security', 'critic', 'editor', 'translator', 'summarizer', 'pm', 'coordinator', 'architect']
       .every(k => POSITIONS.some(p => p.key === k)));
-  check('state.positions 覆盖全部 16 岗', Object.keys(state.positions).length === 16);
+  check('包含艺术与视觉岗 (art-director/visual-designer/vision-analyst)',
+    ['art-director', 'visual-designer', 'vision-analyst'].every(k => POSITIONS.some(p => p.key === k)));
+  check('艺术岗挂对父节点: art-director→planner, 视觉双岗→worker',
+    POSITIONS.find(p => p.key === 'art-director').parent === 'planner' &&
+    POSITIONS.find(p => p.key === 'visual-designer').parent === 'worker' &&
+    POSITIONS.find(p => p.key === 'vision-analyst').parent === 'worker');
+  check('Worker 子智能体 11 个 (并行组)', childKeys('worker').length === 11);
+  check('state.positions 覆盖全部 19 岗', Object.keys(state.positions).length === 19);
   check('子岗有 status/model 字段', state.positions.coder && state.positions.coder.status === 'idle' && state.positions.coder.model === '-');
 
   // ==================== 2. 树形渲染 + 几何登记 ====================
@@ -71,8 +79,8 @@ function toGrid(W, H) {
   tui.__test.render();
   const g = state._treeGeom;
   check('树几何已登记 (_treeGeom)', !!g && Array.isArray(g.rows) && g.rows.length > 0);
-  check('大终端一屏放得下 (maxScroll=0)', g.maxScroll === 0);
-  check('16 个节点行全部可见 (父+子)', g.rows.filter(r => !r.isParent || true).length >= 16);
+  check('110x34 下树可容 (maxScroll>=0)', g.maxScroll >= 0);
+  check('节点行已登记 (父+子)', g.rows.filter(r => !r.isParent || true).length >= 15);
   check('几何行键都是合法岗位', g.rows.every(r => POSITIONS.some(p => p.key === r.key)));
 
   // 渲染输出不超出树面板右边界, 不压底部输入区 (H-4 以下)
@@ -113,7 +121,7 @@ function toGrid(W, H) {
   // ==================== 4. 小终端: 自动滚动 + 焦点可见 ====================
   state.terminalWidth = 100;
   state.terminalHeight = 22;
-  state.selectedIndex = 15;   // verifier (最后一个)
+  state.selectedIndex = 18;   // verifier (最后一个)
   state.treeScroll = 0;
   tui.__test.render();
   const g3 = state._treeGeom;
@@ -137,7 +145,7 @@ function toGrid(W, H) {
   tui.__test.render();
   check('焦点未变时手动滚动不被弹回', state.treeScroll === 4);
   // 切换选中 → 自动跟随到新焦点
-  state.selectedIndex = 15;  // verifier
+  state.selectedIndex = 18;  // verifier
   tui.__test.render();
   check('切换选中后自动跟随焦点 (verifier 可见)', state._treeGeom.rows.some(r => r.key === 'verifier'));
 

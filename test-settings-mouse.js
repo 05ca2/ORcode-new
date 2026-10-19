@@ -35,6 +35,7 @@ function check(name, cond) {
 (async () => {
   const tui = require('./scripts/tui.js');
   const state = tui.__test.initState();
+  const POSITIONS_FLAT = tui.__test.POSITIONS;
   state.terminalWidth = 100;
   state.terminalHeight = 30;
 
@@ -117,6 +118,39 @@ function check(name, cond) {
   const posModel0 = state.positions[Object.keys(state.positions)[1]]?.model;
   tui.__test.handleMouseClick(posBtn.x1, posBtn.row);
   check('再点同一岗位 = 循环换模型', state.positions[Object.keys(state.positions)[1]]?.model !== posModel0);
+
+  // ==================== 2b. 子模型 (职能岗) 也能在设置中改 ====================
+  // 滚遍整个面板, 收集所有岗位按钮 (19 个岗位: 4 流程 + 15 职能)
+  const seenPos = new Set();
+  for (let s = 0; s <= (state._settingsMaxScroll || 0); s++) {
+    state.settingsScroll = s;
+    tui.__test.renderSettingsPanel();
+    state._settingsGeom.buttons.filter(b => b.action === 'position').forEach(b => seenPos.add(b.arg));
+  }
+  check('设置面板列出全部 19 个岗位', seenPos.size === 19);
+  check('职能岗 (art-director/visual-designer/vision-analyst) 在列',
+    [5, 16, 17].every(i => seenPos.has(i)));   // 扁平索引: 5=art-director, 16=visual-designer, 17=vision-analyst
+  // 点一个职能岗两次 → 换模型
+  const subIdx = POSITIONS_FLAT.findIndex(p => p.key === 'visual-designer');
+  let subBtn = null;
+  for (let s = 0; s <= (state._settingsMaxScroll || 0) && !subBtn; s++) {
+    state.settingsScroll = s;
+    tui.__test.renderSettingsPanel();
+    subBtn = state._settingsGeom.buttons.find(b => b.action === 'position' && b.arg === subIdx);
+  }
+  check('视觉设计师岗位行可点', !!subBtn);
+  const subModel0 = state.positions['visual-designer'].model;
+  tui.__test.handleMouseClick(subBtn.x1, subBtn.row);
+  check('点子模型岗位行 = 选中', state.settingsPos === subIdx);
+  tui.__test.handleMouseClick(subBtn.x1, subBtn.row);
+  check('再点同一子模型 = 循环换模型', state.positions['visual-designer'].model !== subModel0);
+  // Esc 保存 → 写入 config.json 的 positions
+  const cfgBefore = JSON.parse(fs.readFileSync(path.join(cfgDir, 'config.json'), 'utf8'));
+  tui.__test.handleSettingsKey('', { name: 'escape', str: '', ctrl: false, meta: false });
+  const cfgAfter = JSON.parse(fs.readFileSync(path.join(cfgDir, 'config.json'), 'utf8'));
+  check('子模型分配已持久化到 config.json', !!cfgAfter.positions['visual-designer']);
+  state.settingsOpen = true;   // 后续测试继续用面板
+  state.settingsScroll = 0;
 
   // 添加模型按钮 (岗位增多后首屏可能放不下, 先滚到底再找)
   state.settingsScroll = state._settingsMaxScroll || 0;

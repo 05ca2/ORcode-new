@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.14',
+  version: '0.2.15',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -126,18 +126,21 @@ const POSITION_TREE = [
     { key: 'coordinator', label: '协调员 Coordinator',        desc: '汇总各岗结论、决定下一步路由' },
   ]},
   { key: 'planner',  label: '规划 Planner',  desc: '制定顺序执行计划', children: [
-    { key: 'architect',   label: '架构师 Architect',          desc: '定方案、模块拆分' },
+    { key: 'architect',     label: '架构师 Architect',          desc: '定方案、模块拆分' },
+    { key: 'art-director',  label: '美术指导 Art Director',     desc: '定视觉风格/配色/构图方向' },
   ]},
   { key: 'worker',   label: '执行 Workers',  desc: '多岗位并发协作执行', children: [
-    { key: 'researcher',  label: '研究员 Researcher',         desc: '联网检索、查证事实' },
-    { key: 'data',        label: '数据师 Data Analyst',       desc: '处理表格、统计与可视化' },
-    { key: 'coder',       label: '程序员 Coder',              desc: '按方案写/改代码' },
-    { key: 'tester',      label: '测试员 Tester',             desc: '写用例、自查边界' },
-    { key: 'security',    label: '安全审计 Auditor',          desc: '查漏洞/越权/注入风险' },
-    { key: 'critic',      label: '批评家 Critic',             desc: '唱反调、找逻辑漏洞' },
-    { key: 'editor',      label: '润色官 Editor',             desc: '调语气、去 AI 味' },
-    { key: 'translator',  label: '翻译官 Translator',          desc: '中英互译、术语对齐' },
-    { key: 'summarizer',  label: '摘要员 Summarizer',         desc: '长输出压成要点' },
+    { key: 'researcher',      label: '研究员 Researcher',         desc: '联网检索、查证事实' },
+    { key: 'data',            label: '数据师 Data Analyst',       desc: '处理表格、统计与可视化' },
+    { key: 'coder',           label: '程序员 Coder',              desc: '按方案写/改代码' },
+    { key: 'tester',          label: '测试员 Tester',             desc: '写用例、自查边界' },
+    { key: 'security',        label: '安全审计 Auditor',          desc: '查漏洞/越权/注入风险' },
+    { key: 'critic',          label: '批评家 Critic',             desc: '唱反调、找逻辑漏洞' },
+    { key: 'editor',          label: '润色官 Editor',             desc: '调语气、去 AI 味' },
+    { key: 'translator',      label: '翻译官 Translator',          desc: '中英互译、术语对齐' },
+    { key: 'summarizer',      label: '摘要员 Summarizer',         desc: '长输出压成要点' },
+    { key: 'visual-designer', label: '视觉设计师 Visual Designer', desc: '产出视觉方案/界面/图标' },
+    { key: 'vision-analyst',  label: '图像分析师 Vision Analyst',  desc: '解读图片/截图/图表' },
   ]},
   { key: 'verifier', label: '检验 Verifier', desc: '核查结果并驱动修复', children: [] },
 ];
@@ -1254,7 +1257,17 @@ function render() {
     write(treeX, ty, `子会话中 · Esc 返回主会话`, c.pink); ty++;
   } else if (state.running && state.activePos) {
     const ap = POSITIONS.find(p => p.key === state.activePos);
-    write(treeX, ty, `▶ 执行中: ${ap ? ap.label : state.activePos} · ${doneCount}/${TOP_POSITION_KEYS.length} 完成`, c.pinkBright); ty++;
+    const kids = childKeys(state.activePos);
+    let line;
+    if (kids.length) {
+      // 有子智能体: 显示并行/顺序进度 (短格式防截断)
+      const kd = kids.filter(k => state.positions[k].status === 'completed').length;
+      const shortName = (ap ? ap.label : state.activePos).split(' ').pop();
+      line = `▶ ${shortName} · 子智能体 ${kd}/${kids.length}${state.activePos === 'worker' ? ' 并行' : ''}`;
+    } else {
+      line = `▶ 执行中: ${ap ? ap.label : state.activePos} · ${doneCount}/${TOP_POSITION_KEYS.length} 完成`;
+    }
+    write(treeX, ty, truncateAnsi(line, Math.max(8, treeAvail)), c.pinkBright); ty++;
   } else if (state.running) {
     write(treeX, ty, `运行中 · ${doneCount}/${TOP_POSITION_KEYS.length} 岗位完成`, c.yellow); ty++;
   } else if (state.waitingForTask) {
@@ -2324,6 +2337,32 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// 某父节点的子智能体 key 列表 (顺序执行用)
+function childKeys(parentKey) {
+  const p = POSITION_TREE.find(t => t.key === parentKey);
+  return p && p.children ? p.children.map(c => c.key) : [];
+}
+
+// 子智能体执行 (模拟): 思考 → 执行 → 完成, 活动实时写入其子会话窗口
+// 并行只限 Workers 的子智能体: 由调用方用 Promise.all 同时发起, 各自独立推进状态
+async function runSubAgent(key, thinkMs, workMs) {
+  const pos = state.positions[key];
+  if (!pos) return;
+  const task = pos.desc || pos.label;
+  state.updatePosition(key, { status: 'thinking' });
+  state.addThought(key, task);
+  subLog(key, `○ ${task}`);
+  render();
+  await sleep(thinkMs);
+  state.updatePosition(key, { status: 'working' });
+  render();
+  await sleep(workMs);
+  state.updatePosition(key, { status: 'completed' });
+  state.addThought(key, '完成');
+  subLog(key, '✓ 完成');
+  render();
+}
+
 async function runHorLoop(instruction) {
   // 无模型守卫
   if (!state.config.models || state.config.models.length === 0) {
@@ -2355,6 +2394,12 @@ async function runHorLoop(instruction) {
   dbManager.logMessage(state.sessionId, 'director', '接收指令', 'info');
   await sleep(700); render();
 
+  // Director 子智能体 (顺序执行 — 并行只限 Workers)
+  for (const k of childKeys('director')) {
+    state.log(`○ 子智能体 · ${POSITIONS.find(p => p.key === k).label}`);
+    await runSubAgent(k, 300, 400);
+  }
+
   // Planner
   state.activePos = 'planner';
   state.updatePosition('planner', { status: 'thinking' });
@@ -2374,19 +2419,35 @@ async function runHorLoop(instruction) {
   dbManager.logMessage(state.sessionId, 'planner', '计划完成', 'success');
   await sleep(300); render();
 
-  // Workers
+  // Planner 子智能体 (顺序执行)
+  for (const k of childKeys('planner')) {
+    state.log(`○ 子智能体 · ${POSITIONS.find(p => p.key === k).label}`);
+    await runSubAgent(k, 300, 400);
+  }
+
+  // Workers: 通用 Worker × N + 全部子智能体, 一起并行 (并行只限 Workers)
   state.activePos = 'worker';
   state.updatePosition('worker', { status: 'working' });
+  const wKids = childKeys('worker');
+  const wStart = Date.now();
+  const genWorkers = [];
   for (let i = 1; i <= state.config.workers; i++) {
-    state.addThought('worker', `Worker ${i} 执行中`);
-    state.log(`● 执行 Workers · Worker ${i} 并发执行`);
-    subLog('worker', `● Worker ${i} 执行中`);
-    dbManager.logMessage(state.sessionId, 'worker', `Worker ${i} 执行`, 'info');
-    await sleep(500); render();
+    genWorkers.push((async (idx) => {
+      state.addThought('worker', `Worker ${idx} 执行中`);
+      state.log(`● 执行 Workers · Worker ${idx} 并发执行`);
+      subLog('worker', `● Worker ${idx} 执行中`);
+      dbManager.logMessage(state.sessionId, 'worker', `Worker ${idx} 执行`, 'info');
+      render();
+      await sleep(600);
+    })(i));
   }
+  state.log(`● 执行 Workers · ${wKids.length} 个子智能体并行执行`);
+  const subAgents = wKids.map((k, i) => runSubAgent(k, 300, 500 + i * 110));
+  await Promise.all([...genWorkers, ...subAgents]);
   state.updatePosition('worker', { status: 'completed' });
-  state.log(`✓ 执行 Workers · ${state.config.workers} 个并发完成`);
-  subLog('worker', `✓ ${state.config.workers} 个并发完成`);
+  const wMs = Date.now() - wStart;
+  state.log(`✓ 执行 Workers · ${state.config.workers} 并发 + ${wKids.length} 子智能体并行完成 (${wMs}ms)`);
+  subLog('worker', `✓ ${state.config.workers} 并发 + ${wKids.length} 子智能体并行完成`);
   await sleep(300); render();
 
   // Verifier
@@ -3794,6 +3855,8 @@ module.exports = {
     subLog: (key, text) => subLog(key, text),
     subKeyForModel: (name) => subKeyForModel(name),
     applySubSessionView: (key) => applySubSessionView(key),
+    runSubAgent: (key, thinkMs, workMs) => runSubAgent(key, thinkMs, workMs),
+    childKeys: (parentKey) => childKeys(parentKey),
     closeSession: (idx) => closeSession(idx)
   }
 };
