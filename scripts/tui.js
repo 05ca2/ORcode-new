@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.15',
+  version: '0.2.16',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -204,6 +204,8 @@ class TUIState {
     this.settingsScroll = 0; // 设置面板内滚动偏移
     this.treeScroll = 0;     // 工作树纵向滚动偏移 (内容超高时)
     this.treeCollapsed = {}; // 工作树折叠状态: {positionKey: true} 收起其子分支
+    this.treeThinking = {};  // 工作树思考展开状态: {positionKey: true} 行内展示该岗思考过程
+    this.subThinkOpen = true; // 子会话窗口中"深度思考"块是否展开
     this._treeFocusToken = null; // 上次自动跟随的焦点 (选中/执行目标@终端尺寸), 变化才跟随
     this._subRoHintAt = 0;       // 只读子窗口提示的节流时间戳
     // 添加模型五步流程: provider → baseUrl → apiKey → modelId → displayName → afterAdd
@@ -1177,22 +1179,34 @@ function render() {
   write(treeX, 2, treeTitle, c.sub);
   const treeAvail = Math.max(16, treeW - 1);
 
-  // 行缓冲: 先按树形收集所有行 (节点行 + 描述行), 再按视窗切片写出, 支持滚动/折叠
+  // 行缓冲: 先按树形收集所有行 (节点行 + 描述行 + 思考行), 再按视窗切片写出, 支持滚动/折叠/思考展开
   const selKey = (state.selectedIndex >= 0 && POSITIONS[state.selectedIndex]) ? POSITIONS[state.selectedIndex].key : null;
   const treeRows = [];
   POSITION_TREE.forEach((tp) => {
     const hasKids = !!(tp.children && tp.children.length);
     const collapsed = !!state.treeCollapsed[tp.key];
+    const thinkOpen = !!state.treeThinking[tp.key];
     const toggle = hasKids ? (collapsed ? ' ▸' : ' ▾') : '';
     treeRows.push({ kind: 'node', node: tp, prefixBar: '', connector: '', isParent: hasKids, toggle });
-    treeRows.push({ kind: 'desc', node: tp, prefixBar: '', connector: '' });
+    treeRows.push({ kind: 'desc', node: tp, prefixBar: '', connector: '', thinkOpen });
+    if (thinkOpen) {
+      const thoughts = (state.positions[tp.key]?.thought || []).slice(-6);
+      thoughts.forEach((t, i) => treeRows.push({ kind: 'think', node: tp, prefixBar: '', connector: '', text: `${i + 1}. ${t}` }));
+      if (thoughts.length === 0) treeRows.push({ kind: 'think', node: tp, prefixBar: '', connector: '', text: '(暂无思考记录)' });
+    }
     if (hasKids && !collapsed) {
       tp.children.forEach((ch, ci) => {
         const isLast = ci === tp.children.length - 1;
         const bar = isLast ? '  ' : '│ ';
         const conn = isLast ? '└─ ' : '├─ ';
+        const chThink = !!state.treeThinking[ch.key];
         treeRows.push({ kind: 'node', node: ch, prefixBar: bar, connector: conn });
-        if (selKey === ch.key) treeRows.push({ kind: 'desc', node: ch, prefixBar: bar, connector: conn });
+        if (selKey === ch.key || chThink) treeRows.push({ kind: 'desc', node: ch, prefixBar: bar, connector: conn, thinkOpen: chThink });
+        if (chThink) {
+          const thoughts = (state.positions[ch.key]?.thought || []).slice(-6);
+          thoughts.forEach((t, i) => treeRows.push({ kind: 'think', node: ch, prefixBar: bar, connector: conn, text: `${i + 1}. ${t}` }));
+          if (thoughts.length === 0) treeRows.push({ kind: 'think', node: ch, prefixBar: bar, connector: conn, text: '(暂无思考记录)' });
+        }
       });
     }
   });
@@ -1217,11 +1231,21 @@ function render() {
 
   let ty = 4;
   const treeGeomRows = [];
+  const treeDescRows = [];
   treeRows.slice(treeScroll, treeScroll + treeVisRows).forEach((r) => {
     const y = ty;
+    if (r.kind === 'think') {
+      const pad = r.prefixBar.length + r.connector.length;
+      write(treeX + pad + 4, y, truncateAnsi(`🧠 ${r.text}`, Math.max(8, treeAvail - pad - 4)), c.yellow);
+      ty++;
+      return;
+    }
     if (r.kind === 'desc') {
       const pad = r.prefixBar.length + r.connector.length;
-      write(treeX + pad + 2, y, truncateAnsi(r.node.desc, Math.max(8, treeAvail - pad - 2)), c.faint);
+      // 描述行即思考折叠开关: ▾ 展开中 / ▸ 已折叠 (点击切换)
+      const marker = r.thinkOpen ? '▾' : '▸';
+      write(treeX + pad, y, `${marker} ${truncateAnsi(r.node.desc, Math.max(8, treeAvail - pad - 2))}`, c.faint);
+      treeDescRows.push({ y, key: r.node.key });
       ty++;
       return;
     }
@@ -1233,23 +1257,36 @@ function render() {
     const arrow = active ? '▶' : (sel ? '▸' : ' ');
     const rowColor = active ? c.pinkBright : (inSub ? c.pink : (sel ? c.text : c.sub));
     const model = state.positions[key]?.model || '-';
-    const activeTag = active ? ' ◀执行中' : (inSub ? ' [子会话]' : '');
+    // 子会话状态由 ◐ 图标 + 底部状态行表达, 不再占文字; 执行中保留高亮标记
+    const activeTag = active ? ' ◀执行中' : '';
     const toggle = r.toggle || '';
-    // 宽度控制: 前缀+箭头/图标+标签+模型+标记 不超出面板右边界
+    const prog = ` · ${progressLabel(key)}`;
+    // 宽度控制: 前缀+箭头/图标+标签+模型+进度+标记 不超出面板右边界; 放不下时次要后缀依次让位
     const prefixW = r.prefixBar.length + r.connector.length + 4; // arrow+' '+icon+' '
-    const reserve = displayWidth(toggle) + displayWidth(activeTag) + 2 + displayWidth(String(model));
-    const labelMax = treeAvail - prefixW - reserve;
+    const modelW = displayWidth(String(model));
+    const toggleW = displayWidth(toggle);
+    let tagW = displayWidth(activeTag);
+    let progW = displayWidth(prog);
+    let labelMax = treeAvail - prefixW - toggleW - progW - tagW - 2 - modelW;
+    if (labelMax < 7 && progW > 0 && tagW > 0) { progW = 0; labelMax = treeAvail - prefixW - toggleW - progW - tagW - 2 - modelW; }
+    if (labelMax < 7 && tagW > 0) { tagW = 0; labelMax = treeAvail - prefixW - toggleW - progW - tagW - 2 - modelW; }
+    if (labelMax < 7 && progW > 0) { progW = 0; labelMax = treeAvail - prefixW - toggleW - progW - tagW - 2 - modelW; }
     const label = labelMax > 6 ? truncateAnsi(r.node.label, labelMax) : r.node.label;
-    const lineW = prefixW + displayWidth(label) + 2 + displayWidth(String(model)) + displayWidth(activeTag);
-    write(treeX, y, `${r.prefixBar}${r.connector}${arrow} ${icon} ${label}  ${c.sub}${model}${c.reset}${activeTag}${toggle}`, rowColor);
+    const usedTag = tagW > 0 ? activeTag : '';
+    const usedProg = progW > 0 ? prog : '';
+    const lineW = prefixW + displayWidth(label) + 2 + modelW + tagW;
+    write(treeX, y, `${r.prefixBar}${r.connector}${arrow} ${icon} ${label}  ${c.sub}${model}${c.reset}${usedTag}${toggle}`, rowColor);
+    if (usedProg) write(treeX + lineW, y, usedProg, c.faint);
     treeGeomRows.push({
       y, key, isParent: r.isParent,
+      iconX1: treeX + r.prefixBar.length + r.connector.length + 2,   // arrow 后 1 列 = 图标
+      iconX2: treeX + r.prefixBar.length + r.connector.length + 2,
       toggleX1: treeX + lineW,
       toggleX2: treeX + lineW + displayWidth(toggle) - 1
     });
     ty++;
   });
-  state._treeGeom = { x: treeX, scroll: treeScroll, maxScroll: treeMaxScroll, visRows: treeVisRows, total: treeRows.length, rows: treeGeomRows };
+  state._treeGeom = { x: treeX, scroll: treeScroll, maxScroll: treeMaxScroll, visRows: treeVisRows, total: treeRows.length, rows: treeGeomRows, descRows: treeDescRows };
 
   ty++;
   const doneCount = TOP_POSITION_KEYS.filter(k => state.positions[k].status === 'completed').length;
@@ -1277,7 +1314,7 @@ function render() {
   }
   const scrollHint = state._treeGeom && state._treeGeom.maxScroll > 0 ? ` · 滚轮可滚 ${state._treeGeom.scroll}/${state._treeGeom.maxScroll}` : '';
   write(treeX, ty, truncateAnsi(`${POSITIONS.length} 个岗位 (${TOP_POSITION_KEYS.length} 流程 + ${POSITIONS.length - TOP_POSITION_KEYS.length} 职能) · ${state.config.models.length} 模型 · ${state.tokens} tok`, Math.max(8, treeAvail)), c.faint);
-  write(treeX, ty + 1, truncateAnsi(`点行尾 ▸/▾ 折叠 · tab 切换${scrollHint}`, Math.max(8, treeAvail)), c.faint);
+  write(treeX, ty + 1, truncateAnsi(`点图标/描述行展开思考 · 行尾 ▸/▾ 折叠${scrollHint}`, Math.max(8, treeAvail)), c.faint);
 
   // ---------- 底部: 输入框 ----------
   const inputY = H - 3;
@@ -1425,7 +1462,32 @@ function renderSubSession(mainW, H) {
   write(2, 11, `◈ 子会话窗口 · ${pos.label}  ${c.sub}(${pos.model})${c.reset}  ${c.yellow}🔒 只读${c.reset}`, c.accent);
   write(2, 12, `${c.faint}${'─'.repeat(mainW - 6)}${c.reset}`, c.faint);
 
-  let ry = 14;
+  // ---- 完成进度条 ----
+  const pb = progressBar(key);
+  const pct = positionProgress(key);
+  const barColor = pct >= 100 ? c.green : (pct > 0 ? c.accent : c.faint);
+  write(2, 13, `${barColor}[${pb.bar}]${c.reset} ${barColor}${pb.text}${c.reset}`);
+
+  let ry = 15;
+
+  // ---- 🧠 深度思考 (可折叠: 点标题行或按 t) ----
+  const thoughts = pos.thought || [];
+  const thinkMarker = state.subThinkOpen ? '▾' : '▸';
+  write(2, ry, `${c.yellow}🧠${c.reset} ${c.text}深度思考${c.reset} ${c.sub}(${thoughts.length})${c.reset} ${c.faint}${thinkMarker}${c.reset}`, c.text);
+  state._subThinkHeaderY = ry;
+  ry++;
+  if (state.subThinkOpen) {
+    if (thoughts.length === 0) {
+      write(4, ry, `${c.faint}(暂无思考 — 该模型参与 /hor-loop 后在此显示推理过程)${c.reset}`, c.faint);
+      ry++;
+    } else {
+      thoughts.forEach((t, i) => {
+        write(4, ry, `${c.faint}${i + 1}.${c.reset} ${c.yellow}${truncateAnsi(t, mainW - 12)}${c.reset}`);
+        ry++;
+      });
+    }
+  }
+  ry++;
 
   // ---- 该模型的子会话记录 (来自 HOR-loop / 单模型调用) ----
   write(2, ry, `${c.sub}▸ 子会话记录 (${state.subSessionLog.length} 条)${c.reset}`, c.sub);
@@ -1434,7 +1496,7 @@ function renderSubSession(mainW, H) {
     write(4, ry, `${c.faint}(暂无记录 — 该模型参与 /hor-loop 或被单模型调用后, 记录会出现在这里)${c.reset}`, c.faint);
     ry++;
   } else {
-    const maxRows = Math.max(3, H - 14 - ry - 8);
+    const maxRows = Math.max(3, H - 6 - ry);
     state.subSessionLog.slice(-maxRows).forEach(l => {
       let color = c.text;
       if (l.includes('✓')) color = c.green;
@@ -1444,23 +1506,9 @@ function renderSubSession(mainW, H) {
       ry++;
     });
   }
-  ry++;
-
-  // ---- 最近思考 ----
-  write(2, ry, `${c.sub}▸ 最近思考${c.reset}`, c.sub);
-  ry++;
-  if (pos.thought.length === 0) {
-    write(4, ry, `${c.faint}(暂无)${c.reset}`, c.faint);
-    ry++;
-  } else {
-    pos.thought.forEach((t, i) => {
-      write(4, ry, `${c.faint}${i + 1}.${c.reset} ${c.yellow}${truncateAnsi(t, mainW - 12)}${c.reset}`);
-      ry++;
-    });
-  }
 
   // ---- 底部提示 ----
-  write(2, H - 4, `${c.yellow}🔒 只读窗口 — 不可与子模型对话${c.reset}${c.faint} · Esc 返回主会话${c.reset}`, c.faint);
+  write(2, H - 4, `${c.yellow}🔒 只读窗口 — 不可与子模型对话${c.reset}${c.faint} · t 折叠思考 · Esc 返回主会话${c.reset}`, c.faint);
 }
 
 // ============ 岗位子会话窗口 (只读) ============
@@ -1506,18 +1554,19 @@ function applySubSessionView(key) {
   state.waitingForTask = false;
   state.historyScroll = 0;
   state.treeScroll = 0;
-  // 岗位状态: 全新一份; "最近思考"用该岗位子会话记录尾部填充
+  // 岗位状态: 复制实时状态 (进度/思考要反映真实情况, 不能重置); 无思考则用子会话记录尾部兜底
   const positions = {};
   POSITIONS.forEach(p => {
+    const live = state.positions[p.key] || {};
+    const thought = (live.thought && live.thought.length) ? live.thought.slice() : getSubSession(p.key).log.slice(-3);
     positions[p.key] = {
       ...p,
-      status: 'idle',
-      model: state.config.positions[p.key]?.name || '-',
-      thought: [],
-      output: null
+      status: live.status || 'idle',
+      model: live.model || (state.config.positions[p.key]?.name || '-'),
+      thought,
+      output: live.output || null
     };
   });
-  positions[key].thought = sub.log.slice(-3);
   state.positions = positions;
 }
 
@@ -1526,11 +1575,22 @@ function openSubSessionTab(key) {
   if (state.running || state.questionnaire) return;
   const exist = state.sessions.findIndex(s => s.kind === 'sub' && s.posKey === key);
   if (exist >= 0) {
+    // switchSession 会用旧快照覆盖 state.positions — 先存下实时状态, 切回后再刷新 (进度/思考反映真实情况)
+    const liveAll = JSON.parse(JSON.stringify(state.positions));
     switchSession(exist);
-    // 从存储刷新显示 (离开期间可能有新活动)
+    POSITIONS.forEach(p => {
+      if (state.positions[p.key] && liveAll[p.key]) {
+        state.positions[p.key].status = liveAll[p.key].status;
+        state.positions[p.key].thought = liveAll[p.key].thought;
+        state.positions[p.key].model = liveAll[p.key].model;
+      }
+    });
+    // 从存储刷新子会话记录 (离开期间可能有新活动); 思考有真实内容则不覆盖
     const sub = getSubSession(key);
     state.subSessionLog = sub.log.slice();
-    if (state.positions[key]) state.positions[key].thought = sub.log.slice(-3);
+    if (state.positions[key] && !(state.positions[key].thought || []).length) {
+      state.positions[key].thought = sub.log.slice(-3);
+    }
     render();
     return;
   }
@@ -2343,6 +2403,42 @@ function childKeys(parentKey) {
   return p && p.children ? p.children.map(c => c.key) : [];
 }
 
+// 岗位完成进度 (0-100): 父节点 = 子智能体完成比例; 叶子 = 自身阶段 (思考35/执行70/完成100)
+function positionProgress(key) {
+  const pos = state.positions[key];
+  if (!pos) return 0;
+  const kids = childKeys(key);
+  if (kids.length) {
+    const done = kids.filter(k => state.positions[k] && state.positions[k].status === 'completed').length;
+    return Math.round((done / kids.length) * 100);
+  }
+  return { idle: 0, thinking: 35, working: 70, completed: 100, error: 100 }[pos.status] || 0;
+}
+
+// 进度短标签: 父节点 "3/11" (子岗完成数), 叶子 "70%"
+function progressLabel(key) {
+  const kids = childKeys(key);
+  if (kids.length) {
+    const done = kids.filter(k => state.positions[k] && state.positions[k].status === 'completed').length;
+    return `${done}/${kids.length}`;
+  }
+  return `${positionProgress(key)}%`;
+}
+
+// 进度条 (子会话窗口用): [■■■■■■░░░░] 70% · 执行中
+function progressBar(key, width = 10) {
+  const pct = positionProgress(key);
+  const filled = Math.round((pct / 100) * width);
+  const bar = '■'.repeat(filled) + '░'.repeat(Math.max(0, width - filled));
+  const st = state.positions[key]?.status;
+  const stText = { idle: '待命', thinking: '思考中', working: '执行中', completed: '已完成', error: '出错' }[st] || '';
+  const kids = childKeys(key);
+  const kidText = kids.length
+    ? ` · 子智能体 ${kids.filter(k => state.positions[k] && state.positions[k].status === 'completed').length}/${kids.length}`
+    : '';
+  return { bar, text: `${pct}% · ${stText}${kidText}` };
+}
+
 // 子智能体执行 (模拟): 思考 → 执行 → 完成, 活动实时写入其子会话窗口
 // 并行只限 Workers 的子智能体: 由调用方用 Promise.all 同时发起, 各自独立推进状态
 async function runSubAgent(key, thinkMs, workMs) {
@@ -3116,11 +3212,35 @@ function handleMouseClick(col, row) {
     return;
   }
 
-  // 点击工作树岗位行 → 在新标签页打开该岗位的子会话窗口 (只读); 点行尾 ▸/▾ 折叠或展开子分支
+  // 子会话窗口: 点击"深度思考"标题行 = 折叠/展开
+  if (state.subSession && state._subThinkHeaderY && row === state._subThinkHeaderY && col < state.terminalWidth - Math.max(30, Math.floor(state.terminalWidth * 0.34))) {
+    state.subThinkOpen = !state.subThinkOpen;
+    render();
+    return;
+  }
+
+  // 点击工作树:
+  //  · 描述行 (▸/▾) → 展开/折叠该岗的思考过程
+  //  · 节点行图标列 → 展开/折叠该岗的思考过程
+  //  · 节点行行尾 ▸/▾ (仅父节点) → 折叠/展开子分支
+  //  · 节点行其他区域 → 在新标签页打开该岗位的子会话窗口 (只读)
   const tg = state._treeGeom;
   if (tg && col >= tg.x) {
+    // ① 描述行 = 思考折叠开关
+    const descHit = (tg.descRows || []).find(r => r.y === row);
+    if (descHit) {
+      state.treeThinking[descHit.key] = !state.treeThinking[descHit.key];
+      render();
+      return;
+    }
+    // ② 节点行
     const hit = tg.rows.find(r => r.y === row);
     if (hit) {
+      if (col >= hit.iconX1 && col <= hit.iconX2) {
+        state.treeThinking[hit.key] = !state.treeThinking[hit.key];
+        render();
+        return;
+      }
       if (hit.isParent && hit.toggleX2 >= hit.toggleX1 && col >= hit.toggleX1 && col <= hit.toggleX2) {
         state.treeCollapsed[hit.key] = !state.treeCollapsed[hit.key];
         render();
@@ -3469,6 +3589,12 @@ async function handleKey(str, key) {
     // Esc 返回主会话标签
     if (key.name === 'escape') {
       returnToMainTab();
+      return;
+    }
+    // t = 折叠/展开"深度思考"块
+    if (str === 't' || str === 'T') {
+      state.subThinkOpen = !state.subThinkOpen;
+      render();
       return;
     }
     // 只读: 输入/回车一律不放行, 仅间隔提示
@@ -3857,6 +3983,9 @@ module.exports = {
     applySubSessionView: (key) => applySubSessionView(key),
     runSubAgent: (key, thinkMs, workMs) => runSubAgent(key, thinkMs, workMs),
     childKeys: (parentKey) => childKeys(parentKey),
+    positionProgress: (key) => positionProgress(key),
+    progressLabel: (key) => progressLabel(key),
+    progressBar: (key) => progressBar(key),
     closeSession: (idx) => closeSession(idx)
   }
 };
