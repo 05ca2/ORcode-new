@@ -55,9 +55,12 @@ npm link
 orcode --version          # → orcode 0.2.16
 ```
 
-**方式 B：下载 ZIP**
+**方式 B：下载 ZIP（最省事）**
 
-在 https://github.com/05ca2/ORcode-new 点 `Code` → `Download ZIP`，或在 https://github.com/05ca2/ORcode-new/releases/latest 下载 **Source code (zip)**，解压后进入解压出来的目录（名字类似 `ORcode-new-main`）再执行 `npm link` / `node orcode.cjs`。
+直接下载已打包好的最新版源码：
+👉 **[ORcode-v0.2.16.zip](https://github.com/05ca2/ORcode-new/releases/download/v0.2.16/ORcode-v0.2.16.zip)**
+
+也可以在新仓库 https://github.com/05ca2/ORcode-new 点 `Code` → `Download ZIP`，或在 https://github.com/05ca2/ORcode-new/releases/latest 的 **Assets** 里下载。解压后进入解压出来的目录，再执行 `npm link` / `node orcode.cjs`，最后用 `orcode --version` 确认是 `0.2.16`。
 
 > 提示：`npm link` 会把 `orcode` 命令软链到全局。若之前 link 过旧仓库，先运行 `npm unlink -g orcode` 再重新 `npm link`，否则命令可能仍指向旧目录。
 
