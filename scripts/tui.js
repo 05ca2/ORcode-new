@@ -16,7 +16,7 @@ const configPath = path.join(configDir, 'config.json');
 
 // 默认配置 (不预置任何假模型, 由用户添加真实模型)
 const defaultConfig = {
-  version: '0.2.16',
+  version: '0.2.17',
   workers: 2,
   verifyRounds: 1,
   defaultModel: null,
@@ -284,8 +284,9 @@ class TUIState {
   addThought(key, text) {
     if (this.positions[key]) {
       this.positions[key].thought.push(text);
-      if (this.positions[key].thought.length > 3) {
-        this.positions[key].thought.shift();
+      // 保留完整推理链 (理解→查看→判断→决定→结论, 多轮运行也不被挤掉)
+      if (this.positions[key].thought.length > 12) {
+        this.positions[key].thought.splice(0, this.positions[key].thought.length - 12);
       }
     }
   }
@@ -1236,7 +1237,13 @@ function render() {
     const y = ty;
     if (r.kind === 'think') {
       const pad = r.prefixBar.length + r.connector.length;
-      write(treeX + pad + 4, y, truncateAnsi(`🧠 ${r.text}`, Math.max(8, treeAvail - pad - 4)), c.yellow);
+      // ◎ = 查看/工具动作行, 🧠 = 推理判断行, ✓ = 结论行 (不同图标与颜色)
+      const isAction = r.text.startsWith('◎');
+      const isDone = r.text.startsWith('✓');
+      const glyph = isAction ? '◎' : (isDone ? '✓' : '🧠');
+      const color = isAction ? c.accent : (isDone ? c.green : c.yellow);
+      const body = isAction ? r.text.slice(1).trim() : r.text;
+      write(treeX + pad + 4, y, truncateAnsi(`${glyph} ${body}`, Math.max(8, treeAvail - pad - 4)), color);
       ty++;
       return;
     }
@@ -1481,8 +1488,19 @@ function renderSubSession(mainW, H) {
       write(4, ry, `${c.faint}(暂无思考 — 该模型参与 /hor-loop 后在此显示推理过程)${c.reset}`, c.faint);
       ry++;
     } else {
-      thoughts.forEach((t, i) => {
-        write(4, ry, `${c.faint}${i + 1}.${c.reset} ${c.yellow}${truncateAnsi(t, mainW - 12)}${c.reset}`);
+      const maxThinkRows = Math.max(2, H - 6 - ry - 5);   // 给下方"子会话记录"留出行数
+      const shown = thoughts.slice(-maxThinkRows);
+      if (thoughts.length > shown.length) {
+        write(4, ry, `${c.faint}… 另有 ${thoughts.length - shown.length} 条更早的推理 (见子会话记录)${c.reset}`, c.faint);
+        ry++;
+      }
+      shown.forEach((t, i) => {
+        const isAction = t.startsWith('◎');
+        const isDone = t.startsWith('✓');
+        const glyph = isAction ? '◎' : (isDone ? '✓' : '🧠');
+        const color = isAction ? c.accent : (isDone ? c.green : c.yellow);
+        const body = isAction ? t.slice(1).trim() : t;
+        write(4, ry, `${c.faint}${thoughts.length - shown.length + i + 1}.${c.reset} ${color}${glyph} ${truncateAnsi(body, mainW - 14)}${c.reset}`);
         ry++;
       });
     }
@@ -2439,23 +2457,79 @@ function progressBar(key, width = 10) {
   return { bar, text: `${pct}% · ${stText}${kidText}` };
 }
 
+// ============ 推理旁白 (Reasoning Trace) ============
+// 每个岗位产出「理解 → 查看/动作 → 判断 → 所以决定 → 结论」的自然语言推理过程,
+// 而不是一句干巴巴的职责标签。◎ 开头的是工具/查看动作行, 渲染时用不同图标与颜色。
+const REASONING_PROFILES = {
+  director:        { role: '统筹分派和最终收敛',       check: '任务描述与工作区概况',           finding: '这类任务单岗一口气做完容易漏环节，先拆再合更稳',     decide: '让规划岗出步骤、并行调度执行岗，最后统一核查再整合输出' },
+  pm:              { role: '把模糊需求拆成可验收目标', check: '任务描述里有没有明确的产出物',   finding: '描述偏口语、缺验收边界，直接开工容易做成别的东西',     decide: '先补一条"什么算做完"，再拆成 3 个带输入/输出的 user story' },
+  coordinator:     { role: '汇总各岗结论并决定路由',   check: '各子岗刚回传的结论有无冲突',     finding: '有两处口径不一致，按 planner 的步骤顺序对齐即可',       decide: '统一术语后把结论打包交给 Director，不额外返工' },
+  planner:         { role: '制定顺序执行计划',         check: '任务依赖与可并行的部分',         finding: '大部分子任务互不依赖，串行会白白浪费时间',             decide: '拆出可并行的执行项交给 Workers，其余保持顺序' },
+  architect:       { role: '定方案与模块边界',         check: '现有目录结构与模块划分',         finding: '直接堆在一个文件里后续不好改，边界要提前划清',         decide: '按输入/处理/输出分三层，模块间只留最小接口' },
+  'art-director':  { role: '定视觉风格与视觉方向',     check: '参考素材与整体视觉风格/配色',   finding: '风格不先定死，后面各产出物会各做各的',                 decide: '先锁定主色、构图与几何语言，再让视觉岗按同一套规范产出' },
+  worker:          { role: '并行推进具体执行',         check: 'Planner 给的步骤与子岗分工',     finding: '这些子任务彼此独立，同时跑不会互相踩',                 decide: '用 Promise.all 一次发起全部子智能体，各自独立收尾' },
+  researcher:      { role: '检索并查证事实',           check: '任务里涉及时效性/不确定信息',   finding: '有两处说法可能过时，不能凭印象写',                     decide: '发起一次联网检索，只用可核实的结果回填' },
+  data:            { role: '处理数据与结构化',         check: '工作区里的表格/数据文件',       finding: '原始数据有缺项，直接统计会偏',                         decide: '先清洗补齐再做汇总，并在结论里标注口径' },
+  coder:           { role: '按方案写出可运行代码',     check: '现有文件、修改: 代码入口与调用链', finding: '照方案直接写会漏掉边界输入，得先补一层校验',          decide: '先写主流程再补边界处理，最后自查一遍再交出' },
+  tester:          { role: '写用例并自查边界',         check: '产出物的正常路径与异常输入',     finding: '空值、超长输入这两类最容易漏',                         decide: '针对性补 3 组边界用例，跑通再标完成' },
+  security:        { role: '排查安全与越权风险',       check: '文件访问范围与外部输入入口',     finding: '有一处路径来自外部输入，存在越权读取的可能',           decide: '加一层工作区边界校验，区外访问一律需授权' },
+  critic:          { role: '唱反调、找逻辑漏洞',       check: '结论链条里跳步的地方',           finding: '从"检索到"直接推到"所以正确"中间少了一步论证',         decide: '把该假设显式列出并要求补证据，不让它悄悄溜过去' },
+  editor:          { role: '调整语气、去掉 AI 味',     check: '成稿里的空话与三段式排比',       finding: '开头两段是套话，读起来像模板',                         decide: '删掉铺垫直接给结论，长句拆短，保留必要的转折' },
+  translator:      { role: '中英互译并统一术语',       check: '术语表与上下文里的专有名词',     finding: '同一个词在两处译法不一致，会误导读者',                 decide: '按术语表统一，并在首次出现处标注英文原词' },
+  'visual-designer': { role: '产出视觉方案与界面',     check: '美术指导给的视觉规范与参考图',   finding: '配色对比度偏低，小尺寸下会糊成一片',                   decide: '提高主色对比、简化几何层级，再出一版可落地的视觉稿' },
+  'vision-analyst': { role: '解读图片/截图/图表',      check: '待分析的图像与其中的标注',       finding: '图里有两处标注和文字描述对不上，需要以图为准',         decide: '逐项核对后输出结构化读图结论，并标出存疑处' },
+  summarizer:      { role: '把长输出压成要点',         check: '各岗结论的重复与结论性句子',     finding: '三分之二是过程描述，真正的结论只有几条',               decide: '只保留可执行的结论与待办，其余折进附录' },
+  verifier:        { role: '核查结果并驱动修复',       check: '产出物与最初的任务要求逐条对照', finding: '有一项验收条件还没被任何子岗覆盖',                     decide: '打回补做该项，复查通过后才允许收敛' }
+};
+const DEFAULT_REASONING = {
+  role: '完成本岗负责的那一段', check: '上一步的产出与任务要求',
+  finding: '输入边界已经清楚，可以直接推进', decide: '按本岗职责产出结论并交给下游'
+};
+
+// 生成该岗位的推理句子数组 (会带上真实任务摘要, 不是写死的泛泛之谈)
+function buildReasoning(key, instruction) {
+  const p = REASONING_PROFILES[key] || DEFAULT_REASONING;
+  const short = String(instruction || '').trim().replace(/\s+/g, ' ').slice(0, 30) || '当前任务';
+  return [
+    `接到「${short}」——我负责${p.role}，先确认输入边界和要交付什么`,
+    `◎ 查看 ${p.check}`,
+    `确认了：${p.finding}`,
+    `所以决定：${p.decide}`,
+    `✓ 完成 — 本岗结论已产出，交给下游继续`
+  ];
+}
+
+// 批量写入思考 + 子会话记录
+function emitReasoning(key, lines) {
+  lines.forEach(l => { state.addThought(key, l); subLog(key, l); });
+  render();
+}
+
 // 子智能体执行 (模拟): 思考 → 执行 → 完成, 活动实时写入其子会话窗口
 // 并行只限 Workers 的子智能体: 由调用方用 Promise.all 同时发起, 各自独立推进状态
-async function runSubAgent(key, thinkMs, workMs) {
+async function runSubAgent(key, thinkMs, workMs, instruction) {
   const pos = state.positions[key];
   if (!pos) return;
-  const task = pos.desc || pos.label;
+  const script = buildReasoning(key, instruction);
   state.updatePosition(key, { status: 'thinking' });
-  state.addThought(key, task);
-  subLog(key, `○ ${task}`);
-  render();
-  await sleep(thinkMs);
+
+  // 推理过程逐条冒出 (理解 → 查看动作 → 判断), 每条都实时上屏 + 归档
+  for (let i = 0; i < 3; i++) {
+    state.addThought(key, script[i]);
+    subLog(key, script[i]);
+    render();
+    await sleep(Math.max(40, Math.floor(thinkMs / 3)));
+  }
+
   state.updatePosition(key, { status: 'working' });
+  state.addThought(key, script[3]);   // 「所以决定：…」
+  subLog(key, script[3]);
   render();
   await sleep(workMs);
+
   state.updatePosition(key, { status: 'completed' });
-  state.addThought(key, '完成');
-  subLog(key, '✓ 完成');
+  state.addThought(key, script[4]);
+  subLog(key, script[4]);
   render();
 }
 
@@ -2484,7 +2558,7 @@ async function runHorLoop(instruction) {
   // Director
   state.activePos = 'director';
   state.updatePosition('director', { status: 'thinking' });
-  state.addThought('director', '接收指令，准备协调');
+  emitReasoning('director', buildReasoning('director', instruction).slice(0, 3));
   state.log(`○ 指挥 Director · 思考中`);
   subLog('director', '○ 思考中…');
   dbManager.logMessage(state.sessionId, 'director', '接收指令', 'info');
@@ -2493,13 +2567,13 @@ async function runHorLoop(instruction) {
   // Director 子智能体 (顺序执行 — 并行只限 Workers)
   for (const k of childKeys('director')) {
     state.log(`○ 子智能体 · ${POSITIONS.find(p => p.key === k).label}`);
-    await runSubAgent(k, 300, 400);
+    await runSubAgent(k, 300, 400, instruction);
   }
 
   // Planner
   state.activePos = 'planner';
   state.updatePosition('planner', { status: 'thinking' });
-  state.addThought('planner', '分析任务需求');
+  emitReasoning('planner', buildReasoning('planner', instruction).slice(0, 3));
   state.log(`○ 规划 Planner · 分析任务需求`);
   subLog('planner', '○ 分析任务需求');
   dbManager.logMessage(state.sessionId, 'planner', '分析任务需求', 'info');
@@ -2510,6 +2584,7 @@ async function runHorLoop(instruction) {
   dbManager.logMessage(state.sessionId, 'planner', '制定执行步骤', 'info');
   await sleep(600); render();
   state.updatePosition('planner', { status: 'completed' });
+  emitReasoning('planner', buildReasoning('planner', instruction).slice(3));
   state.log(`✓ 规划 Planner · 计划完成`);
   subLog('planner', '✓ 计划完成');
   dbManager.logMessage(state.sessionId, 'planner', '计划完成', 'success');
@@ -2518,12 +2593,13 @@ async function runHorLoop(instruction) {
   // Planner 子智能体 (顺序执行)
   for (const k of childKeys('planner')) {
     state.log(`○ 子智能体 · ${POSITIONS.find(p => p.key === k).label}`);
-    await runSubAgent(k, 300, 400);
+    await runSubAgent(k, 300, 400, instruction);
   }
 
   // Workers: 通用 Worker × N + 全部子智能体, 一起并行 (并行只限 Workers)
   state.activePos = 'worker';
   state.updatePosition('worker', { status: 'working' });
+  emitReasoning('worker', buildReasoning('worker', instruction).slice(0, 3));
   const wKids = childKeys('worker');
   const wStart = Date.now();
   const genWorkers = [];
@@ -2538,9 +2614,10 @@ async function runHorLoop(instruction) {
     })(i));
   }
   state.log(`● 执行 Workers · ${wKids.length} 个子智能体并行执行`);
-  const subAgents = wKids.map((k, i) => runSubAgent(k, 300, 500 + i * 110));
+  const subAgents = wKids.map((k, i) => runSubAgent(k, 300, 500 + i * 110, instruction));
   await Promise.all([...genWorkers, ...subAgents]);
   state.updatePosition('worker', { status: 'completed' });
+  emitReasoning('worker', buildReasoning('worker', instruction).slice(3));
   const wMs = Date.now() - wStart;
   state.log(`✓ 执行 Workers · ${state.config.workers} 并发 + ${wKids.length} 子智能体并行完成 (${wMs}ms)`);
   subLog('worker', `✓ ${state.config.workers} 并发 + ${wKids.length} 子智能体并行完成`);
@@ -2549,6 +2626,7 @@ async function runHorLoop(instruction) {
   // Verifier
   state.activePos = 'verifier';
   state.updatePosition('verifier', { status: 'thinking' });
+  emitReasoning('verifier', buildReasoning('verifier', instruction).slice(0, 3));
   for (let r = 1; r <= state.config.verifyRounds; r++) {
     state.addThought('verifier', `第 ${r} 轮核查`);
     state.log(`○ 检验 Verifier · 第 ${r} 轮核查`);
@@ -2560,12 +2638,13 @@ async function runHorLoop(instruction) {
     dbManager.logMessage(state.sessionId, 'verifier', `第 ${r} 轮通过`, 'success');
   }
   state.updatePosition('verifier', { status: 'completed' });
+  emitReasoning('verifier', buildReasoning('verifier', instruction).slice(3));
   await sleep(300); render();
 
   // Director 最终输出 (荧光粉)
   state.activePos = 'director';
   state.updatePosition('director', { status: 'working' });
-  state.addThought('director', '整合所有结果');
+  emitReasoning('director', buildReasoning('director', instruction).slice(3));
   state.log(`○ 指挥 Director · 整合输出`);
   subLog('director', '○ 整合输出');
   dbManager.logMessage(state.sessionId, 'director', '整合输出', 'info');
@@ -2614,7 +2693,12 @@ async function runSingleModel(instruction) {
   state.log('  ▸ 思考中...');
   state.activePos = 'director';
   state.updatePosition('director', { status: 'thinking' });
-  state.addThought('director', `单模型调用: ${instruction.substring(0, 24)}`);
+  // 推理过程: 写进当前显示的岗位, 同时归档到该模型所属岗位的子会话
+  const singleScript = buildReasoning(subKey, instruction).slice(0, 3);
+  singleScript.forEach(l => {
+    state.addThought('director', l);
+    subLog(subKey, l);
+  });
   render();
 
   // 构造仅含默认模型的配置, 复用 callModelSafe
@@ -2636,7 +2720,9 @@ async function runSingleModel(instruction) {
 
   state.updatePosition('director', { status: 'completed' });
   state.activePos = null;
-  state.addThought('director', '响应完成');
+  const singleDone = buildReasoning(subKey, instruction)[4];
+  state.addThought('director', singleDone);
+  subLog(subKey, singleDone);
   state.log('  ▸ 响应:');
   subLog(subKey, '  ▸ 响应:');
   String(result).split('\n').forEach(line => {
@@ -3983,6 +4069,9 @@ module.exports = {
     applySubSessionView: (key) => applySubSessionView(key),
     runSubAgent: (key, thinkMs, workMs) => runSubAgent(key, thinkMs, workMs),
     childKeys: (parentKey) => childKeys(parentKey),
+    buildReasoning: (key, text) => buildReasoning(key, text),
+    REASONING_PROFILES,
+    emitReasoning: (key, lines) => emitReasoning(key, lines),
     positionProgress: (key) => positionProgress(key),
     progressLabel: (key) => progressLabel(key),
     progressBar: (key) => progressBar(key),
