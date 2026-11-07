@@ -58,7 +58,7 @@ orcode --version          # → orcode 0.2.16
 **方式 B：下载 ZIP（最省事）**
 
 直接下载已打包好的最新版源码：
-👉 **[ORcode-v0.2.16.zip](https://github.com/05ca2/ORcode-new/releases/download/v0.2.16/ORcode-v0.2.16.zip)**
+👉 **[ORcode-v0.2.17.zip](https://github.com/05ca2/ORcode-new/releases/download/v0.2.17/ORcode-v0.2.17.zip)**
 
 也可以在新仓库 https://github.com/05ca2/ORcode-new 点 `Code` → `Download ZIP`，或在 https://github.com/05ca2/ORcode-new/releases/latest 的 **Assets** 里下载。解压后进入解压出来的目录，再执行 `npm link` / `node orcode.cjs`，最后用 `orcode --version` 确认是 `0.2.16`。
 
