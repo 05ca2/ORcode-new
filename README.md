@@ -36,7 +36,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/05ca2/ORcode.git
+git clone https://github.com/05ca2/ORcode-new.git
 cd ORcode
 
 # 2. （可选）设为全局命令，之后可在任意目录使用 `orcode`
