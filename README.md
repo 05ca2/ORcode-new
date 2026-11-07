@@ -34,20 +34,32 @@
 
 ### 安装
 
+> ⚠️ **别下错仓库**：GitHub 上有两个同名仓库——
+> - ✅ **`05ca2/ORcode-new`** ← 本项目，持续更新（当前 **v0.2.16**）
+> - ❌ `05ca2/ORcode`（不带 `-new`）← **已废弃的旧版**，停在 2026-10-11 / v0.2.0，不要再下载
+>
+> 下载后运行 `orcode --version`，应显示 **`orcode 0.2.16`**；若显示 `0.2.0` 或更早，说明拿到的是旧仓库。
+
+**方式 A：git clone（推荐）**
+
 ```bash
-# 1. 克隆仓库
+# 1. 克隆（注意仓库名带 -new，生成的目录也叫 ORcode-new）
 git clone https://github.com/05ca2/ORcode-new.git
-cd ORcode
+cd ORcode-new
 
 # 2. （可选）设为全局命令，之后可在任意目录使用 `orcode`
 npm link
 # 或直接用 node 运行（无需安装）：node orcode.cjs
 
-# 3. 查看版本
-orcode --version
+# 3. 验证版本
+orcode --version          # → orcode 0.2.16
 ```
 
-> 提示：`npm link` 会把 `orcode` 命令软链到全局；若不想污染全局，直接 `node orcode.cjs` 也能用。
+**方式 B：下载 ZIP**
+
+在 https://github.com/05ca2/ORcode-new 点 `Code` → `Download ZIP`，或在 https://github.com/05ca2/ORcode-new/releases/latest 下载 **Source code (zip)**，解压后进入解压出来的目录（名字类似 `ORcode-new-main`）再执行 `npm link` / `node orcode.cjs`。
+
+> 提示：`npm link` 会把 `orcode` 命令软链到全局。若之前 link 过旧仓库，先运行 `npm unlink -g orcode` 再重新 `npm link`，否则命令可能仍指向旧目录。
 
 ### 初始化（引导添加第一个真实模型）
 
