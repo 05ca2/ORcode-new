@@ -1324,7 +1324,7 @@ function render() {
   const prompt = '> ';
   let placeholder = 'Ask ORcode to do anything (单模型调用) · /hor-loop 多模型工作流';
   if (state.addStep === 'provider') placeholder = '步骤 1/5 · 输入供应商名称 (如 openai / deepseek / ollama)';
-  else if (state.addStep === 'workspace') placeholder = '初始化 · 输入默认工作区目录 (必填, 如 /home/user/projects 或 ~/projects)';
+  else if (state.addStep === 'workspace') placeholder = '初始化 · 默认工作区目录 (必填, 如 ~/projects · Mac: ~/Developer/orcode)';
   else if (state.addStep === 'baseUrl') placeholder = '步骤 2/5 · 输入 Base URL (如 https://api.deepseek.com/v1，本地可 http://localhost:11434)';
   else if (state.addStep === 'apiKey') placeholder = '步骤 3/5 · 输入 API Key (可留空，直接回车跳过)';
   else if (state.addStep === 'modelId') placeholder = '步骤 4/5 · 输入模型 ID (如 deepseek-chat / qwen-max)';
@@ -2655,7 +2655,7 @@ function startInit() {
   state.addStep = 'workspace';
   state.addDraft = { provider: '', baseUrl: '', apiKey: '', modelId: '', displayName: '' };
   setInput('');
-  state.log('◆ 初始化 ORcode — 步骤 0: 输入默认工作区目录 (必填, 如 ~/projects 或 /home/user/projects)');
+  state.log('◆ 初始化 ORcode — 步骤 0: 输入默认工作区目录 (必填, 如 ~/projects · Mac: ~/Developer/orcode)');
   render();
 }
 
@@ -2996,7 +2996,7 @@ function confirmAddStep(text) {
   switch (state.addStep) {
     case 'workspace':
       if (!t) {
-        state.log('◍ 默认工作区不能为空 — 请重新输入 (如 ~/projects)');
+        state.log('◍ 默认工作区不能为空 — 请重新输入 (如 ~/projects 或 ~/Developer/orcode)');
         render();
         return;
       }

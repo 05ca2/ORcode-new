@@ -47,7 +47,7 @@ function init() {
     console.log('\n📦 首次使用 — 完成初始化 (默认工作区必填, 模型可稍后补)');
 
     // 步骤 0: 默认工作区 (必填)
-    const workspace = (await ask('  步骤 0 · 默认工作区目录 (必填, 如 ~/projects 或 /home/user/projects): ')).trim();
+    const workspace = (await ask('  步骤 0 · 默认工作区目录 (必填, 如 ~/projects · Mac: ~/Developer/orcode · Win: C:\\Users\\me\\projects): ')).trim();
     let ws = workspace;
     if (!ws) {
       rl.close();

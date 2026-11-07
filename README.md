@@ -64,6 +64,29 @@ orcode --version          # → orcode 0.2.16
 
 > 提示：`npm link` 会把 `orcode` 命令软链到全局。若之前 link 过旧仓库，先运行 `npm unlink -g orcode` 再重新 `npm link`，否则命令可能仍指向旧目录。
 
+### 默认工作区路径怎么填（`orcode init` 步骤 0）
+
+初始化第一步要填一个「默认工作区目录」——ORcode 会在这里读写文件、存放会话存档，权限系统也以它为界（区内放行、区外申请）。**建议先建好目录再填**：
+
+```bash
+mkdir -p ~/Developer/orcode     # macOS / Linux
+```
+
+| 系统 | 推荐写法 | 展开后的实际路径 |
+|------|----------|------------------|
+| **macOS** | `~/Developer/orcode` 或 `~/Documents/ORcode` | `/Users/你的用户名/Developer/orcode` |
+| macOS（绝对路径） | `/Users/你的用户名/Projects` | 原样使用 |
+| Linux | `~/projects` | `/home/你的用户名/projects` |
+| Windows | `C:\Users\你\projects` | 原样使用 |
+
+几个要点：
+
+- `~` 会自动展开成当前用户的家目录——**Mac 是 `/Users/用户名`，不是 Linux 的 `/home/用户名`**。不确定就在终端跑 `echo $HOME` 看一眼。
+- **路径带空格没问题**：这是交互式整行输入，直接从访达拖文件夹进终端也行，不用加引号或转义。
+- 路径含中文也没问题（如 `~/桌面/我的项目`）。
+- 只写 `./xxx` 这类相对路径会按**运行 `orcode` 时所在的目录**解析，容易跑偏，建议用 `~/...` 或绝对路径。
+- 想改：直接编辑 `~/.orcode/config.json` 里的 `defaultWorkspaceDir`，或在 TUI 里用 `/cd`（当前会话）/ `/move`（切换项目目录）。
+
 ### 初始化（引导添加第一个真实模型）
 
 ```bash
